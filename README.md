@@ -68,9 +68,9 @@ sh scripts/val_syn.sh
 After running, the images and numerical results are available in corresponding scene folders.
 
 ### Download pre-optimized scenes
-You can also directly download the reconstructed scenes for different scenes in the real defocus dataset and synthetic dataset from [this url](https://drive.google.com/drive/folders/1E3ZDelbCZn2ypUtho9C2k0PqCruse8dP?usp=sharing) and put the decompressed folder in `./output/` folder. Then the `./output` folder should be like:
+You can also directly download the reconstructed scenes for different scenes in the real defocus dataset and synthetic dataset from [this url](https://drive.google.com/drive/folders/1E3ZDelbCZn2ypUtho9C2k0PqCruse8dP?usp=sharing) and put the decompressed folder in `./output/` folder. Then the `./output/model_dofgs/` folder should be like:
 
-The file structure of the `./output/` folder should be:
+The file structure of the `./output/model_dofgs/` folder should be:
 
 ```
 output/
@@ -88,7 +88,7 @@ output/
 
 Note: The original checkpoints were unfortunately lost during server migration. We have reproduced the models, and the performance may slightly differ from the results reported in the paper.
 
-All of the parameters can be easily specified by editing config_files/config_xxx.yaml
+All of the parameters can be easily specified by editing `config_files/config_xxx.yaml`.
 <details>
 <summary><strong> Key Configuration Parameters (Click to expand)</strong></summary>
 
