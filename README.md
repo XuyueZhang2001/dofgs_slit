@@ -10,6 +10,12 @@
   <h3 align="center"><a href="https://arxiv.org/pdf/2405.17351">Paper</a> | <a href="https://arxiv.org/abs/2405.17351"> Arxiv </a> | <a href="https://dof-gs.github.io/">Project Page</a> </h3>
   <div align="center"></div>
 
+  <video width="640" height="360" autoplay loop muted playsinline>
+  <source src="./assets/demo_videos.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+
+
 
 ### Installation
 Clone the repository and create an anaconda environment using
@@ -96,7 +102,7 @@ All of the parameters can be easily specified by editing `config_files/config_xx
 - `scene_name`: List of scene(s) to be trained or evaluated (e.g., `real_cake`)
 - `model_version`: Specifies the directory under `src/` that contains the core module implementation
 - `output_path`: The path where output results are saved. This does not need to be specified manually—it will be automatically derived from `model_folder`, `model_version` and `scene_name`
-`source_path`: The path to the data corresponding to `scene_name`.  It does not need to be provided explicitly, as it will be automatically retrieved from `config_files\scene_info.yaml`
+- `source_path`: The path to the data corresponding to `scene_name`.  It does not need to be provided explicitly, as it will be automatically retrieved from `config_files\scene_info.yaml`
 - `num_extra_points`: Number of extra points to be added during densification
 - `iterations`: Total number of training iterations
 - `test_iterations`, `save_iterations`: Iterations at which evaluation and checkpoint saving occur
