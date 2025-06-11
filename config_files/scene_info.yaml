@@ -1,0 +1,49 @@
+real_bush:
+  source_path: ./data/DeblurNeRF_data/real_defocus_blur/defocusbush
+  holdout: 13
+real_cake: 
+  source_path: ./data/DeblurNeRF_data/real_defocus_blur/defocuscake
+  holdout: 9
+real_caps:
+  source_path: ./data/DeblurNeRF_data/real_defocus_blur/defocuscaps
+  holdout: 5
+real_cisco: 
+  source_path: ./data/DeblurNeRF_data/real_defocus_blur/defocuscisco
+  holdout: 7
+real_coral: 
+  source_path: ./data/DeblurNeRF_data/real_defocus_blur/defocuscoral
+  holdout: 10
+real_cupcake: 
+  source_path: ./data/DeblurNeRF_data/real_defocus_blur/defocuscupcake
+  holdout: 6
+real_cups: 
+  source_path: ./data/DeblurNeRF_data/real_defocus_blur/defocuscups
+  holdout: 8
+real_daisy:
+  source_path: ./data/DeblurNeRF_data/real_defocus_blur/defocusdaisy
+  holdout: 8
+real_sausage:
+  source_path: ./data/DeblurNeRF_data/real_defocus_blur/defocussausage
+  holdout: 6
+real_seal:
+  source_path: ./data/DeblurNeRF_data/real_defocus_blur/defocusseal
+  holdout: 6
+real_tools: 
+  source_path: ./data/DeblurNeRF_data/real_defocus_blur/defocustools
+  holdout: 7
+
+synthetic_cozy2room: 
+  source_path: ./data/DeblurNeRF_data/synthetic_defocus_blur/defocuscozy2room
+  holdout: 8
+synthetic_factory: 
+  source_path: ./data/DeblurNeRF_data/synthetic_defocus_blur/defocusfactory
+  holdout:  8
+synthetic_pool:
+  source_path: ./data/DeblurNeRF_data/synthetic_defocus_blur/defocuspool
+  holdout: 8
+synthetic_tanabata:
+  source_path: ./data/DeblurNeRF_data/synthetic_defocus_blur/defocustanabata
+  holdout: 8
+synthetic_wine: 
+  source_path: ./data/DeblurNeRF_data/synthetic_defocus_blur/defocuswine
+  holdout: 8

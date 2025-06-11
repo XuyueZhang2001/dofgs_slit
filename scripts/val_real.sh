@@ -1,0 +1,10 @@
+OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=0 python render.py --config ./config_files/config_real_cake.yaml --scene 'real_cake' --iteration 15000 --skip_train
+OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=0 python render.py --config ./config_files/config_real_caps.yaml --scene 'real_caps' --iteration 15000 --skip_train
+OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=0 python render.py --config ./config_files/config_real_cisco.yaml --scene 'real_cisco' --iteration 30000 --skip_train
+OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=0 python render.py --config ./config_files/config_real_cupcake.yaml --scene 'real_cupcake' --iteration 7000 --skip_train
+OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=0 python render.py --config ./config_files/config_real_cups.yaml --scene 'real_cups' --iteration 40000 --skip_train
+OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=0 python render.py --config ./config_files/config_real_daisy.yaml --scene 'real_daisy' --iteration 25000 --skip_train
+OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=0 python render.py --config ./config_files/config_real_sausage.yaml --scene 'real_sausage' --iteration 3000 --skip_train
+OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=0 python render.py --config ./config_files/config_real_seal.yaml --scene 'real_seal' --iteration 40000 --skip_train
+OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=0 python render.py --config ./config_files/config_real_tools.yaml --scene 'real_tools' --iteration 40000 --skip_train
+OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=0 python render.py --config ./config_files/config_real_coral.yaml --scene 'real_coral' --iteration 40000 --skip_train
