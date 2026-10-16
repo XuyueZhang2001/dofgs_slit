@@ -47,3 +47,10 @@ synthetic_tanabata:
 synthetic_wine: 
   source_path: ./data/DeblurNeRF_data/synthetic_defocus_blur/defocuswine
   holdout: 8
+slitsim_real_cake:
+  source_path: ./data/slit_sim/slitsim_real_cake
+  holdout: 8
+
+disksim_real_cake:
+  source_path: ./data/slit_sim/disksim_real_cake
+  holdout: 8

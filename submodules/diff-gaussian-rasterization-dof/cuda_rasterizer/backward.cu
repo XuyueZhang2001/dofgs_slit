@@ -154,11 +154,16 @@ __global__ void computeCov2DCUDA(int P,
 	const float* view_matrix,
 	const float* F,
 	const float* K,
+	const float* Kw,
+	const float* theta,
+	const float aperture_coeff,
 	const float coc2z_coeff,
 	const int vIdx,
 	const float* dL_dconics,
 	float* __restrict__  dL_dK,
 	float* __restrict__ dL_dF,
+	float* __restrict__ dL_dKw,
+	float* __restrict__ dL_dtheta,
 	glm::vec3* dL_dmeans,
 	float* dL_dcov,
 	const float4* __restrict__ conic_opacity,
@@ -208,13 +213,15 @@ __global__ void computeCov2DCUDA(int P,
 	glm::mat3 cov2D = glm::transpose(T) * glm::transpose(Vrk) * T;
 
 
-	// add a defocus variation matrix to Cov2D
-	float D_diff = 1.0f / max(t.z, 0.0000001f) - 1.0f / F[vIdx];
-	float coc_radius = 0.5f * K[vIdx] * abs(D_diff);
-	// float coc_radius = 0.5f * focal_length * aperture_px * abs( 1.0f / focal_distance - 1.0f / max(p_view.z, 0.0000001f));
-	float coc_coeff = CoC_coeff * coc_radius * coc_radius;
-	cov2D[0][0] += coc_coeff;
-	cov2D[1][1] += coc_coeff;
+	// Re-compute the slit-aperture defocus covariance exactly as in the forward pass.
+	const SlitCoC coc = computeSlitCoC(t.z, F[vIdx], K[vIdx], Kw[vIdx], theta[vIdx], aperture_coeff);
+	cov2D[0][0] += coc.da;
+	cov2D[0][1] += coc.db;
+	cov2D[1][0] += coc.db;
+	cov2D[1][1] += coc.dc;
+
+	// dL/dd (d = |1/z - 1/F|), accumulated below and reused for F and depth.
+	float dL_dd = 0.0f;
 
 	const float det_0 = max(1e-6, cov2D[0][0] * cov2D[1][1] - cov2D[0][1] * cov2D[0][1]);
 	const float det_1 = max(1e-6, (cov2D[0][0] + kernel_size) * (cov2D[1][1] + kernel_size) - cov2D[0][1] * cov2D[0][1]);
@@ -243,7 +250,7 @@ __global__ void computeCov2DCUDA(int P,
 	float denom = a * c - b * b;
 	float dL_da = 0, dL_db = 0, dL_dc = 0;
 	float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
-	float grad_F = 0, grad_K = 0;
+	float grad_F = 0, grad_K = 0, grad_Kw = 0, grad_theta = 0;
 
 
 	if (denom2inv != 0)
@@ -267,17 +274,34 @@ __global__ void computeCov2DCUDA(int P,
 			dL_dopacity[idx] = dL_dopacity[idx] * coef;
 		}
 
-		grad_K = CoC_coeff * coc_radius * abs(D_diff) * dL_da + CoC_coeff * coc_radius * abs(D_diff) * dL_dc;
-		if (D_diff >= 0)
-		{
-			grad_F = CoC_coeff * coc_radius * K[vIdx] / (F[vIdx] * F[vIdx]) * (dL_da + dL_dc);
-		}
-		else
-		{
-			grad_F = -1.0f * CoC_coeff * coc_radius * K[vIdx] / (F[vIdx] * F[vIdx]) * (dL_da + dL_dc);
-		}
+		// Gradients w.r.t. the slit aperture parameters.
+		// dL/dsL and dL/dsW: project the cov2D gradient onto the slit axes.
+		// (dL_db is the gradient w.r.t. the single symmetric off-diagonal entry.)
+		const float cs2 = coc.cs * coc.cs;
+		const float sn2 = coc.sn * coc.sn;
+		const float sncs = coc.sn * coc.cs;
+		const float dL_dsL = dL_da * cs2 + dL_db * sncs + dL_dc * sn2;
+		const float dL_dsW = dL_da * sn2 - dL_db * sncs + dL_dc * cs2;
+
+		// sL = coeff * (0.5 * K * d)^2  ->  dsL/dK = coeff * rL * d,  dsL/dd = coeff * rL * K
+		grad_K  = dL_dsL * aperture_coeff * coc.rL * coc.d;
+		grad_Kw = dL_dsW * aperture_coeff * coc.rW * coc.d;
+		dL_dd   = dL_dsL * aperture_coeff * coc.rL * K[vIdx]
+		        + dL_dsW * aperture_coeff * coc.rW * Kw[vIdx];
+
+		// d(da)/dtheta = -(sL - sW) sin2t, d(db)/dtheta = (sL - sW) cos2t, d(dc)/dtheta = (sL - sW) sin2t
+		const float sin2t = 2.0f * sncs;
+		const float cos2t = cs2 - sn2;
+		grad_theta = (coc.sL - coc.sW) * ((dL_dc - dL_da) * sin2t + dL_db * cos2t);
+
+		// d = |1/z - 1/F|  ->  dd/dF = sign(D) / F^2
+		const float sgnD = (coc.D >= 0.0f) ? 1.0f : -1.0f;
+		grad_F = dL_dd * sgnD / (F[vIdx] * F[vIdx]);
+
 		atomicAdd(&(dL_dF[vIdx]), grad_F);
 		atomicAdd(&(dL_dK[vIdx]), grad_K);
+		atomicAdd(&(dL_dKw[vIdx]), grad_Kw);
+		atomicAdd(&(dL_dtheta[vIdx]), grad_theta);
 
 		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry, 
 		// given gradients w.r.t. 2D covariance matrix (diagonal).
@@ -334,15 +358,10 @@ __global__ void computeCov2DCUDA(int P,
 	// If we choose to backward gradient from coc_radius to depth value of the gaussian
 	if (coc2z_coeff > 0)
 	{
-		float dL_dCr_dtz = 0; // the gradient of Cr w.r.t. the z coordinate of the point within the camera view space
-		if (D_diff >= 0)
-		{
-			dL_dCr_dtz = -1.0f * CoC_coeff * coc_radius * K[vIdx] * tz2 * (dL_da + dL_dc);
-		}
-		else
-		{
-			dL_dCr_dtz = 1.0f * CoC_coeff * coc_radius * K[vIdx] * tz2 * (dL_da + dL_dc);
-		}
+		// Gradient of the defocus covariance w.r.t. the view-space depth z:
+		// d = |1/z - 1/F|  ->  dd/dz = -sign(D) / z^2
+		const float sgnD = (coc.D >= 0.0f) ? 1.0f : -1.0f;
+		float dL_dCr_dtz = -1.0f * sgnD * tz2 * dL_dd;
 
 		dL_dtz = dL_dtz + coc2z_coeff * dL_dCr_dtz;
 	}
@@ -734,6 +753,9 @@ void BACKWARD::preprocess(
 	const float* projmatrix,
 	const float* F,
 	const float* K,
+	const float* Kw,
+	const float* theta,
+	const float aperture_coeff,
 	const float coc2z_coeff,
 	const int vIdx,
 	const float focal_x, float focal_y,
@@ -751,7 +773,9 @@ void BACKWARD::preprocess(
 	const float4* conic_opacity,
 	float* dL_dopacity,
 	float* dL_dK,
-	float* dL_dF)
+	float* dL_dF,
+	float* dL_dKw,
+	float* dL_dtheta)
 {
 	// Propagate gradients for the path of 2D conic matrix computation. 
 	// Somewhat long, thus it is its own kernel rather than being part of 
@@ -768,10 +792,12 @@ void BACKWARD::preprocess(
 		tan_fovy,
 		kernel_size,
 		viewmatrix,
-		F, K, coc2z_coeff, vIdx,
+		F, K, Kw, theta, aperture_coeff, coc2z_coeff, vIdx,
 		dL_dconic,
 		dL_dK,
 		dL_dF,
+		dL_dKw,
+		dL_dtheta,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcov3D,
 		conic_opacity,

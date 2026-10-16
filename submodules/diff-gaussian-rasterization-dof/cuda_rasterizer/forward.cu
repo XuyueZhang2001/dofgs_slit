@@ -171,6 +171,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float* projmatrix,
 	const float* F,
 	const float* K,
+	const float* Kw,
+	const float* theta,
+	const float aperture_coeff,
 	const int vIdx,
 	const glm::vec3* cam_pos,
 	const int W, int H,
@@ -234,12 +237,17 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float lambda2_0 = mid_0 - sqrt(max(0.1f, mid_0 * mid_0 - det_0));
 	float my_radius_0 = ceil(3.f * sqrt(max(lambda1_0, lambda2_0)));
 
-	// add a defocus variation matrix to Cov2D
-	float coc_radius = 0.5f * K[vIdx] * abs( 1.0f / F[vIdx] - 1.0f / max(p_view.z, 0.0000001f));
-	// float coc_radius = 0.5f * focal_length * aperture_px * abs( 1.0f / focal_distance - 1.0f / max(p_view.z, 0.0000001f));
-	float coc_coeff = CoC_coeff * coc_radius * coc_radius;
-	cov.x = cov.x + coc_coeff;
-	cov.z = cov.z + coc_coeff;
+	// Add the (possibly anisotropic) defocus covariance of the slit aperture.
+	// K is the long-axis aperture scale, Kw the short-axis scale and theta the
+	// slit orientation in image space. With K == Kw this is the original
+	// isotropic DOF-GS circle of confusion.
+	const SlitCoC coc = computeSlitCoC(p_view.z, F[vIdx], K[vIdx], Kw[vIdx], theta[vIdx], aperture_coeff);
+	// Long-axis CoC radius; kept as the per-Gaussian scalar used for the CoC map.
+	float coc_radius = coc.rL;
+	cov.x = cov.x + coc.da;
+	cov.y = cov.y + coc.db; // off-diagonal is stored twice (y and w)
+	cov.z = cov.z + coc.dc;
+	cov.w = cov.w + coc.db;
 
 	// re-calculate the coeffient for the opacity after considering the coc_radius
 	const float det_0_pri = max(1e-6, (cov.x - kernel_size) * (cov.z - kernel_size) - cov.y * cov.w);
@@ -489,6 +497,9 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float* projmatrix,
 	const float* F,
 	const float* K,
+	const float* Kw,
+	const float* theta,
+	const float aperture_coeff,
 	const int vIdx,
 	const glm::vec3* cam_pos,
 	const int W, int H,
@@ -520,7 +531,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		colors_precomp,
 		viewmatrix, 
 		projmatrix,
-		F, K, vIdx,
+		F, K, Kw, theta, aperture_coeff, vIdx,
 		cam_pos,
 		W, H,
 		tan_fovx, tan_fovy,

@@ -60,6 +60,9 @@ namespace BACKWARD
 		const float* proj,
 		const float* F,
 		const float* K,
+		const float* Kw,
+		const float* theta,
+		const float aperture_coeff,
 		const float coc2z_coeff,
 		const int vIdx,
 		const float focal_x, float focal_y,
@@ -77,7 +80,9 @@ namespace BACKWARD
 		const float4* conic_opacity,
 		float* dL_dopacity,
 		float* dL_dK,
-		float* dL_dF);
+		float* dL_dF,
+		float* dL_dKw,
+		float* dL_dtheta);
 }
 
 #endif

@@ -19,10 +19,19 @@ import torch.nn as nn
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
           focal_distance = None, K_apert = None, select_view = 0, tone_map=None, 
-          kernel_size=0.1, band_limit=False, subpixel_offset=None, scaling_modifier = 1.0, override_color = None):
+          kernel_size=0.1, band_limit=False, subpixel_offset=None, scaling_modifier = 1.0, override_color = None,
+          K_w = None, slit_theta = None):
     """
     Render the scene. 
     Background tensor (bg_color) must be on GPU!
+
+    focal_distance / K_apert : explicit (N, 1) focus distance / long-axis aperture.
+        If both are None, the optimized per-view parameters of `pc` are used.
+    K_w        : optional (N, 1) short-axis aperture (slit). Defaults to the
+                 optimized value (slit model) or K_apert (isotropic).
+    slit_theta : optional (N, 1) slit orientation in radians, overriding the
+                 known per-view angles (e.g. to render a new slit angle; see
+                 GaussianModel.slit_theta_for_angle).
     """
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
@@ -53,7 +62,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
         prefiltered=False,
         vIdx = select_view,
         coc2z_coeff = 0.0,
-        debug=pipe.debug
+        debug=pipe.debug,
+        aperture_coeff = pc.aperture_coeff
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -66,8 +76,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
         opacity = pc.get_opacity
     
     if focal_distance is None and K_apert is None:
-        focal_distance = torch.clamp(pc.Fs, 0.01, 1000) * 10.0 
-        K_apert = torch.clamp(pc.Ks, 0.01, 200)  * 100.0 + 100.0
+        # Optimized defocus parameters (identical mapping to the original code
+        # for the circular aperture; see GaussianModel.get_defocus_params).
+        focal_distance, K_apert, Kw_opt, theta_opt = pc.get_defocus_params()
+        if K_w is None:
+            K_w = Kw_opt
+        if slit_theta is None:
+            slit_theta = theta_opt
 
 
     scales = None
@@ -111,7 +126,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp, 
         F=focal_distance,
-        K=K_apert)
+        K=K_apert,
+        Kw=K_w,
+        theta=slit_theta)
     
 
     if tone_map is not None:

@@ -22,6 +22,62 @@
 // defocus blur kernel coefficients
 __device__ const float CoC_coeff = 0.36067376022224085f; // 1 / (2ln4)
 
+// ---------------------------------------------------------------------------
+// Anisotropic defocus model for a centered, rotatable slit (rectangular)
+// aperture.
+//
+// For a point at view-space depth z and focus distance F, the defocus amount is
+//     d  = |1/z - 1/F|
+// The half-lengths of the projected rectangular PSF along the long and short
+// slit axes are
+//     rL = 0.5 * KL * d ,   rW = 0.5 * KW * d
+// The PSF is approximated by a Gaussian whose variance along each axis is
+//     sL = coeff * rL^2 ,   sW = coeff * rW^2
+// (coeff = 1/3 matches the variance of a uniform box of full length 2r;
+//  coeff = 1/(2 ln 4) with KL == KW reproduces the original isotropic DOF-GS.)
+//
+// With the slit long axis u = (cos t, sin t) in image coordinates
+// (x to the right, y downwards, t measured from +x towards +y), the added
+// screen-space covariance is
+//     dSigma = sL * u u^T + sW * v v^T ,  v = (-sin t, cos t)
+// i.e.
+//     da = sL cos^2 t + sW sin^2 t
+//     db = (sL - sW) sin t cos t
+//     dc = sL sin^2 t + sW cos^2 t
+//
+// Because the aperture is centered on the optical axis, the PSF is symmetric
+// under a 180-degree rotation, so points in front of and behind the focal
+// plane produce the same PSF shape and the PSF center does not shift.
+// ---------------------------------------------------------------------------
+struct SlitCoC
+{
+	float D;      // signed defocus 1/z - 1/F
+	float d;      // |D|
+	float rL, rW; // half-lengths along the long / short slit axis (pixels)
+	float sL, sW; // Gaussian variances along the long / short slit axis
+	float cs, sn; // cos(theta), sin(theta)
+	float da, db, dc; // increments added to cov2D (xx, xy, yy)
+};
+
+__forceinline__ __device__ SlitCoC computeSlitCoC(
+	float z, float F, float KL, float KW, float theta, float coeff)
+{
+	SlitCoC s;
+	s.D = 1.0f / max(z, 0.0000001f) - 1.0f / F;
+	s.d = fabsf(s.D);
+	s.rL = 0.5f * KL * s.d;
+	s.rW = 0.5f * KW * s.d;
+	s.sL = coeff * s.rL * s.rL;
+	s.sW = coeff * s.rW * s.rW;
+	sincosf(theta, &s.sn, &s.cs);
+	const float cs2 = s.cs * s.cs;
+	const float sn2 = s.sn * s.sn;
+	s.da = s.sL * cs2 + s.sW * sn2;
+	s.db = (s.sL - s.sW) * s.sn * s.cs;
+	s.dc = s.sL * sn2 + s.sW * cs2;
+	return s;
+}
+
 // Spherical harmonics coefficients
 __device__ const float SH_C0 = 0.28209479177387814f;
 __device__ const float SH_C1 = 0.4886025119029199f;
@@ -178,9 +234,13 @@ __forceinline__ __device__ bool in_frustum(int idx,
 	return true;
 }
 
+// In debug mode, also query cudaGetLastError(): launch-time failures (e.g.
+// "no kernel image is available", "too many resources requested") are not
+// returned by cudaDeviceSynchronize().
 #define CHECK_CUDA(A, debug) \
 A; if(debug) { \
-auto ret = cudaDeviceSynchronize(); \
+auto ret = cudaGetLastError(); \
+if (ret == cudaSuccess) ret = cudaDeviceSynchronize(); \
 if (ret != cudaSuccess) { \
 std::cerr << "\n[CUDA ERROR] in " << __FILE__ << "\nLine " << __LINE__ << ": " << cudaGetErrorString(ret); \
 throw std::runtime_error(cudaGetErrorString(ret)); \

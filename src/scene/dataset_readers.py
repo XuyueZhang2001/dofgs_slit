@@ -161,13 +161,23 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
-    if eval:
+    # Optional explicit split: <path>/split.json = {"test": [image_name, ...]}.
+    # Used by simulated slit datasets, where several images share one pose and
+    # the index-based LLFF hold-out would scatter test views across angles.
+    split_file = os.path.join(path, "split.json")
+    if eval and os.path.isfile(split_file):
+        with open(split_file, "r") as f:
+            test_names = set(json.load(f)["test"])
+        print(f'Using explicit train/test split from {split_file} ({len(test_names)} test views)')
+        train_cam_infos = [c for c in cam_infos if c.image_name not in test_names]
+        test_cam_infos = [c for c in cam_infos if c.image_name in test_names]
+    elif eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
         test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []
-    
+
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 

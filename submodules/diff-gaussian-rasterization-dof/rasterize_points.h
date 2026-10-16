@@ -29,6 +29,9 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& projmatrix,
 	const torch::Tensor& F,
 	const torch::Tensor& K,
+	const torch::Tensor& Kw,
+	const torch::Tensor& theta,
+	const float aperture_coeff,
 	const int vIdx,
 	const float tan_fovx, 
 	const float tan_fovy,
@@ -42,7 +45,7 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,
 	const bool debug);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -56,6 +59,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor& projmatrix,
 	const torch::Tensor& F,
 	const torch::Tensor& K,
+	const torch::Tensor& Kw,
+	const torch::Tensor& theta,
+	const float aperture_coeff,
 	const float coc2z_coeff,
 	const int vIdx,
 	const float tan_fovx, 

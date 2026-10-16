@@ -13,6 +13,8 @@ from argparse import Namespace
 from src.metrics import compute_img_metric
 import imageio.v2 as imageio
 import numpy as np
+import math
+from src.utils.slit_utils import load_slit_angles
    
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -113,8 +115,28 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
         print('\t'.join([item.image_name for item in viewpoint_stack]))
         
     gaussians.compute_3D_filter(cameras=trainCameras)
+
+    # Slit aperture: per-view known angles, in the same view-index order as mapping_dict.
+    slit_cfg = None
+    if getattr(dataset, 'aperture_type', 'disk') == 'slit':
+        view_names = sorted(mapping_dict.keys(), key=lambda n: mapping_dict[n])
+        slit_thetas = load_slit_angles(view_names,
+                                       angle_file=getattr(dataset, 'slit_angle_file', ''),
+                                       source_path=dataset.source_path,
+                                       name_regex=getattr(dataset, 'slit_angle_regex', ''))
+        slit_cfg = {
+            'thetas': slit_thetas,
+            'width_ratio': getattr(dataset, 'slit_width_ratio', 0.1),
+            'share_F': getattr(dataset, 'slit_share_F', True),
+            'share_K': getattr(dataset, 'slit_share_K', True),
+            'learn_theta_offset': getattr(dataset, 'slit_learn_theta_offset', True),
+        }
+        print('Slit angles (deg): ' + ', '.join(
+            f'{n}:{math.degrees(t):.1f}' for n, t in zip(view_names, slit_thetas.squeeze(1).tolist())))
+
     gaussians.setup_defocus_params(len(viewpoint_stack), scene.cameras_translate, 
-                                    dataset.source_path, mask_act='sigmoid', COC_MAX=dataset.coc_max)
+                                    dataset.source_path, mask_act='sigmoid', COC_MAX=dataset.coc_max,
+                                    slit_cfg=slit_cfg)
     scene.gaussians = gaussians
     
     # Set up training stuffs, such as optimizers
@@ -260,6 +282,9 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
                 if not os.path.isdir(save_folder):
                     os.makedirs(save_folder)
                 gaussians.save_defocus_params(f"{save_folder}/defocus_params.pth")            
+                if gaussians.aperture_type == 'slit':
+                    print(f"[ITER {ori_iter}] slit width ratio: {gaussians.slit_width_ratio():.4f}, "
+                          f"theta offset: {math.degrees(gaussians.theta_offset.item()):.3f} deg")
 
             
 
@@ -291,8 +316,7 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
                         
             if iteration == opt.iter_stop_cam_gd:
                 print(f'turn off the gradient for camera parameters at {iteration:d}-th iteration')
-                gaussians.Fs.requires_grad_(False)
-                gaussians.Ks.requires_grad_(False)
+                gaussians.freeze_defocus_params()
                     
             
             # manually adding gaussian points to quickly densify the scene

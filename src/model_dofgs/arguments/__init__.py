@@ -58,6 +58,22 @@ class ModelParams(ParamGroup):
         self.eval = True
         self.coc_max = 15
         self.hold = 8
+        # ---- rotating slit aperture ----
+        # 'disk': original DOF-GS circular aperture; 'slit': centered rotatable slit.
+        self.aperture_type = 'disk'
+        # JSON {image_name: angle_deg}; empty -> <source_path>/slit_angles.json
+        self.slit_angle_file = ''
+        # Optional regex whose first group is the angle (deg) in the image name,
+        # used for images missing from the angle file.
+        self.slit_angle_regex = ''
+        # Initial short-axis / long-axis aperture ratio of the slit.
+        self.slit_width_ratio = 0.1
+        # Share one focus distance / aperture scale across all views (same lens
+        # setting for the whole capture). Set to false to learn them per view.
+        self.slit_share_F = True
+        self.slit_share_K = True
+        # Learn a global offset between the nominal slit angles and the image axes.
+        self.slit_learn_theta_offset = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -94,6 +110,8 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         self.fdist_lr = 0.001
         self.kapert_lr = 0.01
+        self.slit_ratio_lr = 0.01
+        self.slit_theta_lr = 0.001
         self.random_background = False
         self.iter_defocus_start = 100
         self.num_extra_points = 100000

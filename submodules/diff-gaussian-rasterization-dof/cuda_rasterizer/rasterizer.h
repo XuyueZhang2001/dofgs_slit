@@ -47,6 +47,9 @@ namespace CudaRasterizer
 			const float* projmatrix,
 			const float* F,
 			const float* K,
+			const float* Kw,
+			const float* theta,
+			const float aperture_coeff,
 			const int vIdx,
 			const float* cam_pos,
 			const float tan_fovx, float tan_fovy,
@@ -76,6 +79,9 @@ namespace CudaRasterizer
 			const float* projmatrix,
 			const float* F,
 			const float* K,
+			const float* Kw,
+			const float* theta,
+			const float aperture_coeff,
 			const float coc2z_coeff,
 			const int vIdx,
 			const float* campos,
@@ -100,6 +106,8 @@ namespace CudaRasterizer
 			float* dL_drot,
 			float*  dL_dK,
 			float*  dL_dF,
+			float*  dL_dKw,
+			float*  dL_dtheta,
 			bool debug);
 	};
 };

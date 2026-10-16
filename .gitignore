@@ -13,3 +13,9 @@ pretrained_models
 **.ckpt 
 **.zip
 **.tar.gz 
+data/
+output/
+logs/
+*.egg-info/
+*.dump
+*.run

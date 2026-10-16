@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 from functools import partial
 import seaborn as sns 
+import math
 
 
 def get_emb(sin_inp):
@@ -66,7 +67,7 @@ def merge_params(conf, args):
     return conf, args
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, tone_map):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, tone_map, slit_sweep=()):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders_0604")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
 
@@ -113,6 +114,15 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
                 outfocus_mask = gaussians.mask_net(idx, pos_enc,
                                                     torch.cat([rendering, norm_depth], dim=-3).detach(), norm_coc.detach())
                 infocus_mask = 1.0 - outfocus_mask
+
+            # Slit aperture: re-render this view with the slit rotated to the requested angles.
+            if gaussians.aperture_type == 'slit' and len(slit_sweep) > 0:
+                for ang in slit_sweep:
+                    sweep = render(view, gaussians, pipeline, background, select_view=idx,
+                                   slit_theta=gaussians.slit_theta_for_angle(math.radians(ang)))
+                    sweep_img = torch.clamp(sweep["render"], 0.0, 1.0)
+                    torchvision.utils.save_image(
+                        sweep_img, os.path.join(render_path, '{}_slit{:06.2f}.png'.format(view.image_name, ang)))
                 
         else:
             renders = render(view, gaussians, pipeline, background, valid_F, valid_K)
@@ -163,7 +173,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 
 
-def render_sets(GaussianModel, dataset, iteration, pipeline, skip_train : bool, skip_test : bool):
+def render_sets(GaussianModel, dataset, iteration, pipeline, skip_train : bool, skip_test : bool, slit_sweep=()):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         print('dataset.hold ', dataset.hold)
@@ -189,7 +199,8 @@ def render_sets(GaussianModel, dataset, iteration, pipeline, skip_train : bool, 
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         if not skip_train:
-            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras().copy(), gaussians, pipeline, background, tone_map)
+            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras().copy(), gaussians, pipeline, background, tone_map,
+                       slit_sweep=slit_sweep)
 
         if not skip_test:
             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras().copy(), gaussians, pipeline, background, tone_map)
@@ -244,6 +255,8 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    # Slit aperture: extra slit angles (deg) at which every training view is re-rendered.
+    parser.add_argument("--slit_sweep", type=float, nargs='*', default=[])
     args = parser.parse_args(sys.argv[5:])
 
 
@@ -281,4 +294,5 @@ if __name__ == "__main__":
         
         # render and compute metrics
         render_sets(GaussianModel, model.extract(cur_args), test_iteration, pipeline.extract(cur_args), 
-                    cur_args.skip_train, cur_args.skip_test)
+                    cur_args.skip_train, cur_args.skip_test,
+                    slit_sweep=getattr(cur_args, 'slit_sweep', []) or [])

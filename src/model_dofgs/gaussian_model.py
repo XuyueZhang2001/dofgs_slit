@@ -18,6 +18,12 @@ from src.utils.ops import (
 )
 from src.model_dofgs.neural_module import MaskNet
 
+# Variance coefficients of the Gaussian approximation of the defocus PSF.
+# DISK: original DOF-GS value for a circular aperture, 1 / (2 ln 4).
+# SLIT: variance of a uniform box of full length 2r is r^2 / 3.
+DISK_APERTURE_COEFF = 0.36067376022224085
+SLIT_APERTURE_COEFF = 1.0 / 3.0
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -62,6 +68,18 @@ class GaussianModel:
         self.Fs = self.Fs.unsqueeze(0)
         self.Ks = self.Ks.unsqueeze(0)
         self.optimize_defocus = False
+
+        # Aperture model. 'disk' is the original DOF-GS; 'slit' is a centered,
+        # rotatable rectangular aperture (see setup_defocus_params).
+        self.aperture_type = 'disk'
+        self.aperture_coeff = DISK_APERTURE_COEFF
+        self.n_view = 1
+        self.slit_share_F = False
+        self.slit_share_K = False
+        self.slit_learn_theta_offset = False
+        self.slit_ratio_raw = None   # logit of (short-axis / long-axis) aperture ratio
+        self.theta_offset = None     # global orientation offset (radians)
+        self.thetas_known = None     # (N_view, 1) known slit angles (radians)
         
 
     def capture(self):
@@ -80,7 +98,8 @@ class GaussianModel:
             self.spatial_lr_scale,
             self.Fs,
             self.Ks,
-            self.mask_net.state_dict()
+            self.mask_net.state_dict(),
+            self.aperture_state_dict()
         )
     
     def restore(self, model_args, training_args):
@@ -98,7 +117,10 @@ class GaussianModel:
         self.spatial_lr_scale,
         self.Fs,
         self.Ks,
-        mask_net_dict) = model_args
+        mask_net_dict) = model_args[:15]
+        if len(model_args) > 15:
+            # checkpoints saved with the slit-aperture extension
+            self.load_aperture_state_dict(model_args[15])
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -234,7 +256,16 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         
-    def setup_defocus_params(self, N_view, camera_translate, dataset_path, mask_act='binary', COC_MAX=15):
+    def setup_defocus_params(self, N_view, camera_translate, dataset_path, mask_act='binary', COC_MAX=15,
+                             slit_cfg=None):
+        """
+        slit_cfg: None for the original circular aperture, otherwise a dict with
+            'thetas'             : (N_view, 1) known slit angles in radians, in view-index order
+            'width_ratio'        : initial short-axis / long-axis aperture ratio, in (0, 1)
+            'share_F'            : share one focus distance across all views
+            'share_K'            : share one aperture scale across all views
+            'learn_theta_offset' : learn a global offset added to all known angles
+        """
         z_median = 1.0 / torch.quantile(1.0 / self._xyz[:, 2], 0.5, interpolation='nearest').item()  + camera_translate[2]
         print('z.median is ', z_median)
 
@@ -245,22 +276,128 @@ class GaussianModel:
         print('K_value is ', K_value)
         K_shrink_factor = (K_value - 100.0) / 1000.0
         
-        self.Fs = torch.ones(N_view, 1)
+        self.n_view = N_view
+        if slit_cfg is not None:
+            self.aperture_type = 'slit'
+            self.aperture_coeff = SLIT_APERTURE_COEFF
+            self.slit_share_F = bool(slit_cfg.get('share_F', True))
+            self.slit_share_K = bool(slit_cfg.get('share_K', True))
+            self.slit_learn_theta_offset = bool(slit_cfg.get('learn_theta_offset', True))
+        else:
+            self.aperture_type = 'disk'
+            self.aperture_coeff = DISK_APERTURE_COEFF
+            self.slit_share_F = False
+            self.slit_share_K = False
+
+        # A shared parameter is stored as a single row and expanded to N_view
+        # in get_defocus_params().
+        n_F = 1 if self.slit_share_F else N_view
+        n_K = 1 if self.slit_share_K else N_view
+
+        self.Fs = torch.ones(n_F, 1)
         self.Fs = self.Fs * z_median                         
         self.Fs = self.Fs / 10.0
         self.Fs = self.Fs.to(self.device)
-        self.Ks = torch.ones(N_view, 1) * 10.0 * K_shrink_factor
+        self.Ks = torch.ones(n_K, 1) * 10.0 * K_shrink_factor
         self.Ks = self.Ks.to(self.device)
         
         self.Fs = nn.Parameter(self.Fs.requires_grad_(True))
         self.Ks = nn.Parameter(self.Ks.requires_grad_(True))
+
+        if self.aperture_type == 'slit':
+            thetas = slit_cfg['thetas'].reshape(N_view, 1).float()
+            assert thetas.shape[0] == N_view, 'slit angles must be given for every training view'
+            self.thetas_known = thetas.to(self.device)
+            ratio = float(slit_cfg.get('width_ratio', 0.1))
+            ratio = min(max(ratio, 1e-4), 1.0 - 1e-4)
+            self.slit_ratio_raw = nn.Parameter(
+                torch.full((1, 1), math.log(ratio / (1.0 - ratio)), device=self.device).requires_grad_(True))
+            self.theta_offset = nn.Parameter(
+                torch.zeros((1, 1), device=self.device).requires_grad_(self.slit_learn_theta_offset))
+            print(f'Slit aperture: {N_view} views, width ratio init {ratio:.3f}, '
+                  f'share_F={self.slit_share_F}, share_K={self.slit_share_K}, '
+                  f'learn_theta_offset={self.slit_learn_theta_offset}')
         self.optimize_defocus = False
         self.mask_net = MaskNet(N_view, act_type=mask_act)
         self.mask_net = self.mask_net.to(self.device)
 
+    # ------------------------------------------------------------------
+    # Defocus / aperture parameters
+    # ------------------------------------------------------------------
+    def get_defocus_params(self):
+        """
+        Map the raw optimized parameters to the physical quantities consumed by
+        the rasterizer. Returns (F, K, Kw, theta), each (N_view, 1); Kw and theta
+        are None for the original circular aperture.
+        """
+        F = torch.clamp(self.Fs, 0.01, 1000) * 10.0
+        K = torch.clamp(self.Ks, 0.01, 200) * 100.0 + 100.0
+        if self.aperture_type != 'slit':
+            return F, K, None, None
+
+        F = F.expand(self.n_view, 1)
+        K = K.expand(self.n_view, 1)
+        # The short axis is tied to the long axis through a ratio in (0, 1),
+        # which keeps Kw < K and reflects the fixed physical slit shape.
+        Kw = K * torch.sigmoid(self.slit_ratio_raw)
+        theta = self.thetas_known + self.theta_offset
+        return F, K, Kw, theta
+
+    def slit_theta_for_angle(self, angle_rad):
+        """(N_view, 1) theta table for rendering every view at a given slit angle."""
+        offset = self.theta_offset.detach() if self.theta_offset is not None else 0.0
+        return torch.full((self.n_view, 1), float(angle_rad), device=self.device) + offset
+
+    def slit_width_ratio(self):
+        if self.slit_ratio_raw is None:
+            return 1.0
+        return torch.sigmoid(self.slit_ratio_raw).item()
+
+    def freeze_defocus_params(self):
+        self.Fs.requires_grad_(False)
+        self.Ks.requires_grad_(False)
+        if self.slit_ratio_raw is not None:
+            self.slit_ratio_raw.requires_grad_(False)
+        if self.theta_offset is not None:
+            self.theta_offset.requires_grad_(False)
+
     def join_optim_defocus_params(self, training_args):
         self.optimizer.add_param_group({'params': [self.Fs], 'lr': training_args.fdist_lr, "name": "fdist"})
         self.optimizer.add_param_group({'params': [self.Ks], 'lr': training_args.kapert_lr, "name": "kapert"})
+        if self.aperture_type == 'slit':
+            self.optimizer.add_param_group({'params': [self.slit_ratio_raw],
+                                            'lr': training_args.slit_ratio_lr, "name": "slit_ratio"})
+            if self.slit_learn_theta_offset:
+                self.optimizer.add_param_group({'params': [self.theta_offset],
+                                                'lr': training_args.slit_theta_lr, "name": "slit_theta"})
+
+    def aperture_state_dict(self):
+        def cpu(t):
+            return None if t is None else t.detach().cpu()
+        return {
+            'aperture_type': self.aperture_type,
+            'aperture_coeff': self.aperture_coeff,
+            'n_view': self.n_view,
+            'share_F': self.slit_share_F,
+            'share_K': self.slit_share_K,
+            'learn_theta_offset': self.slit_learn_theta_offset,
+            'slit_ratio_raw': cpu(self.slit_ratio_raw),
+            'theta_offset': cpu(self.theta_offset),
+            'thetas_known': cpu(self.thetas_known),
+        }
+
+    def load_aperture_state_dict(self, state):
+        self.aperture_type = state['aperture_type']
+        self.aperture_coeff = state['aperture_coeff']
+        self.n_view = state['n_view']
+        self.slit_share_F = state['share_F']
+        self.slit_share_K = state['share_K']
+        self.slit_learn_theta_offset = state['learn_theta_offset']
+        if self.aperture_type == 'slit':
+            self.slit_ratio_raw = nn.Parameter(state['slit_ratio_raw'].to(self.device).requires_grad_(True))
+            self.theta_offset = nn.Parameter(
+                state['theta_offset'].to(self.device).requires_grad_(self.slit_learn_theta_offset))
+            self.thetas_known = state['thetas_known'].to(self.device)
        
     def join_optim_mlp_params(self, training_args):
         for name, p in self.mask_net.named_parameters():
@@ -296,7 +433,7 @@ class GaussianModel:
             self.join_optim_defocus_params(training_args)
 
         # the group list within which the group params won't be pruned or densitified.
-        self.const_group_list = ["fdist", "kapert"] 
+        self.const_group_list = ["fdist", "kapert", "slit_ratio", "slit_theta"] 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -330,6 +467,7 @@ class GaussianModel:
         state_dict ={}
         state_dict['focal_distance'] = self.Fs.detach().cpu()
         state_dict['K_aperture'] = self.Ks.detach().cpu()
+        state_dict['aperture'] = self.aperture_state_dict()
         state_dict['mask_net_dict'] = self.mask_net.cpu().state_dict()
         torch.save(state_dict, path)
         self.mask_net.to(self.device)
@@ -339,6 +477,8 @@ class GaussianModel:
         self.Fs = state_dict['focal_distance']
         self.Ks = state_dict['K_aperture']
         mask_net_dict = state_dict['mask_net_dict']
+        if 'aperture' in state_dict:
+            self.load_aperture_state_dict(state_dict['aperture'])
         
         self.Fs = self.Fs.to(self.device)
         self.Ks = self.Ks.to(self.device)

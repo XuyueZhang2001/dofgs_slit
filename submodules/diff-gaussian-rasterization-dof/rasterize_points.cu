@@ -46,6 +46,9 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& projmatrix,
 	const torch::Tensor& F,
 	const torch::Tensor& K,
+	const torch::Tensor& Kw,
+	const torch::Tensor& theta,
+	const float aperture_coeff,
 	const int vIdx,
 	const float tan_fovx, 
 	const float tan_fovy,
@@ -115,6 +118,9 @@ RasterizeGaussiansCUDA(
 		projmatrix.contiguous().data<float>(),
 		F.contiguous().data<float>(),
 	  	K.contiguous().data<float>(),
+	  	Kw.contiguous().data<float>(),
+	  	theta.contiguous().data<float>(),
+	  	aperture_coeff,
 	  	vIdx,
 		campos.contiguous().data<float>(),
 		tan_fovx,
@@ -133,7 +139,7 @@ RasterizeGaussiansCUDA(
   return std::make_tuple(rendered, out_color, out_depth, out_xy, radii, radii_diff, coc_alpha, geomBuffer, binningBuffer, imgBuffer);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -147,6 +153,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor& projmatrix,
 	const torch::Tensor& F,
 	const torch::Tensor& K,
+	const torch::Tensor& Kw,
+	const torch::Tensor& theta,
+	const float aperture_coeff,
 	const float coc2z_coeff,
 	const int vIdx,
 	const float tan_fovx,
@@ -186,6 +195,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_drotations = torch::zeros({P, 4}, means3D.options());
   torch::Tensor dL_dK = torch::zeros({T, 1}, means3D.options());
   torch::Tensor dL_dF = torch::zeros({T, 1}, means3D.options());
+  // Gradients of the slit aperture parameters (short-axis scale and orientation).
+  torch::Tensor dL_dKw = torch::zeros({T, 1}, means3D.options());
+  torch::Tensor dL_dtheta = torch::zeros({T, 1}, means3D.options());
   
   if(P != 0)
   {  
@@ -203,6 +215,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  projmatrix.contiguous().data<float>(),
 	  F.contiguous().data<float>(),
 	  K.contiguous().data<float>(),
+	  Kw.contiguous().data<float>(),
+	  theta.contiguous().data<float>(),
+	  aperture_coeff,
 	  coc2z_coeff,
 	  vIdx,
 	  campos.contiguous().data<float>(),
@@ -228,10 +243,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_drotations.contiguous().data<float>(),
 	  dL_dK.contiguous().data<float>(),
 	  dL_dF.contiguous().data<float>(),
+	  dL_dKw.contiguous().data<float>(),
+	  dL_dtheta.contiguous().data<float>(),
 	  debug);
   }
 
-  return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations, dL_dK, dL_dF);
+  return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations, dL_dK, dL_dF, dL_dKw, dL_dtheta);
 }
 
 torch::Tensor markVisible(

@@ -216,6 +216,9 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* projmatrix,
 	const float* F,
 	const float* K,
+	const float* Kw,
+	const float* theta,
+	const float aperture_coeff,
 	const int vIdx,
 	const float* cam_pos,
 	const float tan_fovx, float tan_fovy,
@@ -268,7 +271,7 @@ int CudaRasterizer::Rasterizer::forward(
 		cov3D_precomp,
 		colors_precomp,
 		viewmatrix, projmatrix,
-		F, K, vIdx,
+		F, K, Kw, theta, aperture_coeff, vIdx,
 		(glm::vec3*)cam_pos,
 		width, height,
 		focal_x, focal_y,
@@ -375,6 +378,9 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* projmatrix,
 	const float* F,
 	const float* K,
+	const float* Kw,
+	const float* theta,
+	const float aperture_coeff,
 	const float coc2z_coeff,
 	const int vIdx,
 	const float* campos,
@@ -399,6 +405,8 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_drot,
 	float*  dL_dK,
 	float*  dL_dF,
+	float*  dL_dKw,
+	float*  dL_dtheta,
 	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
@@ -463,7 +471,7 @@ void CudaRasterizer::Rasterizer::backward(
 		cov3D_ptr,
 		viewmatrix,
 		projmatrix,
-		F, K, coc2z_coeff, vIdx,
+		F, K, Kw, theta, aperture_coeff, coc2z_coeff, vIdx,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
 		kernel_size,
@@ -479,5 +487,7 @@ void CudaRasterizer::Rasterizer::backward(
 		geomState.conic_opacity,
 		dL_dopacity,
 		dL_dK,
-		dL_dF), debug)
+		dL_dF,
+		dL_dKw,
+		dL_dtheta), debug)
 }
