@@ -186,10 +186,46 @@ The script also writes `config_files/config_slitsim_real_cake.yaml` and register
 ```shell
 python tools/simulate_slit_dataset.py --config ./config_files/config_real_cake.yaml \
     --scene real_cake --iteration 15000 \
-    --aperture disk --match_slit ./data/slit_sim/slitsim_real_cake
+    --aperture disk --match_area ./data/slit_sim/slitsim_real_cake
 ```
 
 This uses the same scene, poses and focus distance, with a disk of the same area as the slit: `K_D = 2·sqrt(K_L·K_W/π)`. It writes `./data/slit_sim/disksim_real_cake/` and a config with `aperture_type: disk`, i.e. the original DOF-GS model. With noise, use the same `--noise_std` as the slit dataset and `--disk_copies <n_angles>`, so both setups receive the same light per image and the same number of captures.
+
+### Fixed-area aperture design (n angles, width ratio)
+
+`tools/aperture_theory.py` predicts, under the Gaussian PSF model, how a rotating slit compares with a disk of the same area. It reports the worst-direction blur variance, the depth-of-field gain at equal light, and, with `--area_px2`, the multi-capture SNR gain per frequency. For n evenly spaced angles over 180°, the optimal width ratio is `a* = tan(90°/n)`.
+
+```shell
+python tools/aperture_theory.py --area_px2 40          # table, CSV and plots in ./output/aperture_theory/
+```
+
+To simulate a design at the same area and focus as an existing dataset, use `--match_area`. Only the width ratio changes. The default design is **n = 4, a = 0.4**, close to `a* = tan(22.5°) = 0.414`. Use `--width_ratio` to set the ratio, or `--optimal_ratio` to use `a*`. The scene name gets a `_n<n>_a<a>` suffix, and the training config fixes the ratio at its true value unless `--learn_ratio` is passed:
+
+```shell
+python tools/simulate_slit_dataset.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --n_angles 4 --width_ratio 0.4 \
+    --match_area ./data/slit_sim/slitsim_real_cake
+```
+
+**Batch sweep.** `tools/run_design_sweep.py` runs simulate → train → evaluate for several designs and the equal-area disk baseline. Finished steps are skipped, so an interrupted sweep can be restarted. At the end it collects the results:
+
+```shell
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --designs 4:0.4 8:0.2      # add --dry_run to preview
+python tools/collect_design_sweep.py --source_scene real_cake              # table + measured-vs-theory plot
+```
+
+| Option | Meaning |
+|---|---|
+| `--train_mode per_view` (default) | one image per iteration, as in DOF-GS; for n = 4 the budget equals the earlier runs |
+| `--train_mode per_pose` | all images of one pose per iteration (`slit_group_by_pose: true`), with the AiF render shared across the angles |
+| `--scale_iterations` | multiply the schedule of slit designs by n / 4, so every image gets the same number of updates (off by default) |
+| `--iterations N` | stretch the whole schedule to N iterations |
+| `--noise_std`, `--disk_copies` | equal noise for all designs; give the disk n copies so that both setups have the same number of captures |
+
+Each variant trains into its own `model_folder` (`slit_sim`, `slit_sim_perpose`, `slit_sim_scaled4`, ...). `collect_design_sweep.py` writes `./output/design_sweep/<scene>/design_sweep.{md,csv}` and `measured_vs_theory.png`.
+
+`render.py --one_angle_per_pose` renders only the first image of every training pose. This is off by default.
 
 ### 3. Train
 
@@ -245,9 +281,12 @@ tools/
   simulate_slit_dataset.py   slit / equal-area disk dataset simulation from a trained DOF-GS scene
   eval_slit_recovery.py      AIF recovery metrics and baselines
   compare_slit_params.py     recovered vs ground-truth optics
+  aperture_theory.py         equal-area slit vs disk theory (optimal ratio, DOF gain, SNR gain)
+  run_design_sweep.py        simulate -> train -> evaluate for several (n, a) designs
+  collect_design_sweep.py    results table and measured-vs-theory plot
 tests/
   test_slit_rasterizer.py    rasterizer smoke test (regression, anisotropy, gradients)
-src/utils/slit_utils.py      slit angle loading
+src/utils/slit_utils.py      slit angle loading, grouping of images by camera pose
 ```
 
 ---

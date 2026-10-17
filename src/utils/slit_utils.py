@@ -25,6 +25,7 @@ import math
 import os
 import re
 
+import numpy as np
 import torch
 
 
@@ -81,3 +82,25 @@ def load_slit_angles(image_names, angle_file="", source_path="", name_regex=""):
 
     thetas = torch.tensor([[math.radians(a)] for a in angles_deg], dtype=torch.float32)
     return thetas
+
+
+def _pose_key(cam, decimals=5):
+    """Hashable key of a camera's extrinsics (R, T), robust to float noise."""
+    R = np.round(np.asarray(cam.R, dtype=np.float64), decimals) + 0.0   # + 0.0 turns -0.0 into 0.0
+    T = np.round(np.asarray(cam.T, dtype=np.float64), decimals) + 0.0
+    return tuple(R.reshape(-1).tolist()) + tuple(T.reshape(-1).tolist())
+
+
+def group_views_by_pose(cameras):
+    """
+    Group cameras that share the same pose (identical R, T), e.g. the n slit
+    orientations captured from one viewpoint. Grouping uses the extrinsics, not
+    the file names, so it works for any naming scheme.
+
+    Returns a list of groups in first-appearance order; each group is a list of
+    (index_in_input, camera) pairs.
+    """
+    groups = {}
+    for i, cam in enumerate(cameras):
+        groups.setdefault(_pose_key(cam), []).append((i, cam))
+    return list(groups.values())

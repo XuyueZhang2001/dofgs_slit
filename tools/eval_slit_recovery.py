@@ -19,10 +19,11 @@ Usage (from the repository root):
 """
 import argparse
 import csv
+import re
 import json
 import os
 import sys
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -35,6 +36,8 @@ from simulate_slit_dataset import build_dataset_args, p11  # also sets repo root
 import torchvision
 from src.scene import Scene
 from src.metrics import compute_img_metric
+from src.utils.slit_utils import group_views_by_pose
+from aperture_theory import summarize as theory_summary
 from src.utils.general_utils import load_yaml_file
 from src.model_dofgs.gaussian_model import GaussianModel
 from src.model_dofgs.renderer import render, ToneMapping
@@ -111,10 +114,12 @@ def main():
     img_dir = os.path.join(out_dir, "strips")
     os.makedirs(img_dir if a.save_images else out_dir, exist_ok=True)
 
-    # group the slit views of each training pose: <pose>_aXX
-    poses = OrderedDict()
-    for idx, cam in enumerate(train_cams):
-        poses.setdefault(cam.image_name.rsplit("_a", 1)[0], []).append((idx, cam))
+    # group the images that share a camera pose (the n slit angles, or disk copies);
+    # the simulator names them <pose>_aXX and stores the AiF ground truth as aif/<pose>.png
+    poses = {}
+    for group in group_views_by_pose(train_cams):
+        stem = re.sub(r"_a\d+$", "", group[0][1].image_name)
+        poses[stem] = group
 
     rows, per_split = [], defaultdict(lambda: defaultdict(list))
     with torch.no_grad():
@@ -169,7 +174,16 @@ def main():
         w.writeheader()
         w.writerows(rows)
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
-        json.dump(dict(scene=a.scene, iteration=a.iteration, sim_gt=sim_gt, summary=summary), f, indent=2)
+        design = dict(aperture=sim_gt.get("aperture", "slit"), n_angles=len(set(sim_gt["angles_deg"])),
+                      width_ratio=sim_gt["width_ratio"], images_per_pose=len(sim_gt["angles_deg"]),
+                      group_by_pose=bool(getattr(conf, "slit_group_by_pose", False)),
+                      iterations=int(getattr(conf, "iterations", a.iteration)), model_folder=conf.model_folder)
+        if design["aperture"] == "slit":
+            theory = sim_gt.get("theory") or theory_summary(sim_gt["width_ratio"], sim_gt["angles_deg"])
+        else:
+            theory = dict(worst_var_ratio=1.0, dof_gain_worst=1.0, mean_var_ratio=1.0, dof_gain_mean=1.0)
+        json.dump(dict(scene=a.scene, iteration=a.iteration, design=design, theory=theory,
+                       sim_gt=sim_gt, summary=summary), f, indent=2)
     print(f"Saved per-view metrics and summary to {out_dir}")
 
 

@@ -17,6 +17,7 @@ import numpy as np
 from functools import partial
 import seaborn as sns 
 import math
+from src.utils.slit_utils import group_views_by_pose
 
 
 def get_emb(sin_inp):
@@ -67,7 +68,8 @@ def merge_params(conf, args):
     return conf, args
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, tone_map, slit_sweep=()):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, tone_map, slit_sweep=(),
+               one_angle_per_pose=False):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders_0604")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
 
@@ -90,7 +92,13 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # under training mode, we have the in-focus localization network, which uses positional encoding for training views as input
         pos_enc = get_2d_emb(1, views[0].original_image.shape[-2], views[0].original_image.shape[-1], 16, torch.device("cuda:0"))
 
-    for idx in tqdm(range(len(views)), desc="Rendering progress"):
+    indices = range(len(views))
+    if one_angle_per_pose and name == 'train':
+        # only the first image of every pose; idx keeps its view index for the per-view optics
+        indices = [group[0][0] for group in group_views_by_pose(views)]
+        print(f'Rendering one image per pose: {len(indices)} of {len(views)} training views')
+
+    for idx in tqdm(indices, desc="Rendering progress"):
         view = views[idx]
         # print(idx, view.image_name)
         if name == 'train':
@@ -173,7 +181,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 
 
-def render_sets(GaussianModel, dataset, iteration, pipeline, skip_train : bool, skip_test : bool, slit_sweep=()):
+def render_sets(GaussianModel, dataset, iteration, pipeline, skip_train : bool, skip_test : bool, slit_sweep=(),
+                one_angle_per_pose=False):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         print('dataset.hold ', dataset.hold)
@@ -200,7 +209,7 @@ def render_sets(GaussianModel, dataset, iteration, pipeline, skip_train : bool, 
 
         if not skip_train:
             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras().copy(), gaussians, pipeline, background, tone_map,
-                       slit_sweep=slit_sweep)
+                       slit_sweep=slit_sweep, one_angle_per_pose=one_angle_per_pose)
 
         if not skip_test:
             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras().copy(), gaussians, pipeline, background, tone_map)
@@ -257,6 +266,9 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     # Slit aperture: extra slit angles (deg) at which every training view is re-rendered.
     parser.add_argument("--slit_sweep", type=float, nargs='*', default=[])
+    # Render only the first image of every training pose (images that share a pose
+    # have the same AiF / depth renders, e.g. the n slit angles).
+    parser.add_argument("--one_angle_per_pose", action="store_true")
     args = parser.parse_args(sys.argv[5:])
 
 
@@ -295,4 +307,5 @@ if __name__ == "__main__":
         # render and compute metrics
         render_sets(GaussianModel, model.extract(cur_args), test_iteration, pipeline.extract(cur_args), 
                     cur_args.skip_train, cur_args.skip_test,
-                    slit_sweep=getattr(cur_args, 'slit_sweep', []) or [])
+                    slit_sweep=getattr(cur_args, 'slit_sweep', []) or [],
+                    one_angle_per_pose=bool(getattr(cur_args, 'one_angle_per_pose', False)))

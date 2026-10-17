@@ -22,12 +22,27 @@ It also writes config_files/config_<new_scene>.yaml and registers <new_scene>
 in config_files/scene_info.yaml.
 
 Circular-aperture baseline (--aperture disk): renders the same scene through a
-centered circular aperture instead. With --match_slit <slit sim folder> it uses
+centered circular aperture instead. With --match_area <slit sim folder> it uses
 the same focus distance and an aperture of the SAME AREA as that slit:
     pi * (K_D / 2)^2 = K_L * K_W   ->   K_D = 2 * sqrt(K_L * K_W / pi)
 (blur lengths are K * |1/z - 1/F|, so equal K-areas mean equal aperture areas).
 The disk PSF is approximated by a Gaussian with the variance of a uniform disk
 (r^2 / 4), consistent with the variance-matched box used for the slit.
+
+Fixed-area designs (--match_area / --area_px2): the aperture AREA is held fixed
+and only the width ratio a = K_W / K_L changes:
+    K_L = sqrt(A / a),  K_W = a * K_L        (A = K_L * K_W, in K units)
+--match_area <sim folder> takes A and the focus distance from an existing
+simulated dataset (slit or disk), so every design is compared at equal light.
+--area_px2 sets A as L x W in px^2 at the most defocused depth (5-95% range).
+The default design is n = 4 angles with width ratio a = 0.4 (close to the
+optimum tan(90 deg / 4) = 0.414). --optimal_ratio uses a* = tan(Delta_max)
+instead, where Delta_max is half the largest gap between slit orientations
+(90 deg / n for n evenly spaced angles); see tools/aperture_theory.py.
+In fixed-area mode the generated training config keeps the width ratio fixed
+at its true value (the slit geometry is known); pass --learn_ratio to learn it.
+--group_by_pose writes slit_group_by_pose: true into the config (all angles of
+one pose per training iteration); by default one image is used per iteration.
 
 Note: the slit images are produced with the same Gaussian PSF approximation
 that the slit model uses for reconstruction, so this is a self-consistency
@@ -35,8 +50,12 @@ test of the optimisation (no model mismatch). Use --noise_std and
 --theta_bias_deg to make it harder.
 
 Usage (from the repository root):
+    # original design: 20 px x 2 px slit at maximal defocus
     python tools/simulate_slit_dataset.py --config ./config_files/config_real_cake.yaml \
         --scene real_cake --iteration 15000 --n_angles 4 --max_blur_px 20 --width_ratio 0.1
+    # same area and focus, 8 angles, optimal width ratio
+    python tools/simulate_slit_dataset.py --config ./config_files/config_real_cake.yaml \
+        --scene real_cake --iteration 15000 --n_angles 8 --match_area ./data/slit_sim/slitsim_real_cake
 """
 import argparse
 import json
@@ -63,6 +82,8 @@ from src.model_dofgs.gaussian_model import GaussianModel, SLIT_APERTURE_COEFF
 # Variance coefficient of a uniform disk of radius r (per axis): r^2 / 4.
 DISK_UNIFORM_COEFF = 0.25
 from src.model_dofgs.renderer import render, ToneMapping
+from aperture_theory import (evenly_spaced_angles, max_offset_deg, optimal_ratio,
+                             summarize as theory_summary)
 
 # Lower bound of the long-axis aperture representable by the current K
 # parametrisation: K = clamp(Ks, 0.01, 200) * 100 + 100.
@@ -79,7 +100,12 @@ def parse_args():
                    help="spread angles over 360 deg instead of 180 deg (theta and theta+180 give identical PSFs)")
     p.add_argument("--max_blur_px", type=float, default=20.0,
                    help="full length (px) of the long-axis PSF at the most defocused depth (5-95%% depth range)")
-    p.add_argument("--width_ratio", type=float, default=0.1, help="ground-truth short/long aperture ratio K_W/K_L")
+    p.add_argument("--width_ratio", type=float, default=0.4,
+                   help="ground-truth short/long aperture ratio K_W/K_L (default 0.4)")
+    p.add_argument("--optimal_ratio", action="store_true",
+                   help="use the optimal width ratio tan(Delta_max) for the chosen angles instead of --width_ratio")
+    p.add_argument("--group_by_pose", action="store_true",
+                   help="generated config trains on all images of one pose per iteration (slit_group_by_pose: true)")
     p.add_argument("--focus_quantile", type=float, default=0.5,
                    help="focus distance as a quantile of the inverse scene depth (0 = far, 1 = near)")
     p.add_argument("--focus_depth", type=float, default=None, help="explicit focus distance, overrides --focus_quantile")
@@ -91,14 +117,27 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--aperture", choices=["slit", "disk"], default="slit",
                    help="simulate the rotating slit, or a circular-aperture baseline")
-    p.add_argument("--match_slit", default=None,
-                   help="(disk) slit simulation folder: reuse its focus distance and match its aperture area")
+    p.add_argument("--match_area", default=None,
+                   help="simulated dataset folder (slit or disk): reuse its focus distance and aperture AREA; "
+                        "a slit then only changes its width ratio, a disk gets the equal-area diameter")
+    p.add_argument("--match_slit", default=None, help="deprecated alias of --match_area")
+    p.add_argument("--area_px2", type=float, default=None,
+                   help="aperture area as L x W in px^2 at the most defocused depth (5-95%% range), "
+                        "e.g. 40 for a 20 x 2 px slit; alternative to --match_area")
+    p.add_argument("--learn_ratio", action="store_true",
+                   help="in fixed-area mode, let the training config learn the width ratio "
+                        "(default: fixed at the true value)")
     p.add_argument("--disk_copies", type=int, default=1,
                    help="(disk) images per pose; >1 only makes sense with noise (equal number of captures)")
     p.add_argument("--defocus_only", action="store_true",
                    help="only (re)write <out>/defocus/*.npy for an existing simulated dataset, "
                         "using the optics stored in its sim_gt.json")
-    return p.parse_args()
+    a = p.parse_args()
+    if a.match_slit and not a.match_area:
+        a.match_area = a.match_slit
+    if a.match_area and a.area_px2 is not None:
+        p.error("use either --match_area or --area_px2, not both")
+    return a
 
 
 def build_dataset_args(conf, scene_dict, scene):
@@ -197,8 +236,20 @@ def main():
     scene_dict = load_yaml_file("config_files/scene_info.yaml")
     dataset, pipe = build_dataset_args(conf, scene_dict, a.scene)
 
+    # ---- aperture design (independent of the scene) ----
+    fixed_area = a.match_area is not None or a.area_px2 is not None
+    angles = (evenly_spaced_angles(a.n_angles, a.full_circle) if a.aperture == "slit"
+              else [0.0] * a.disk_copies)
+    if a.aperture == "slit":
+        ratio = optimal_ratio(angles) if a.optimal_ratio else a.width_ratio
+        if not 0.0 < ratio <= 1.0:
+            raise ValueError(f"width ratio must be in (0, 1], got {ratio}")
+
     prefix = "slitsim_" if a.aperture == "slit" else "disksim_"
-    new_scene = a.new_scene or prefix + a.scene.replace("synthetic", "syn")
+    base = prefix + a.scene.replace("synthetic", "syn")
+    if a.aperture == "slit" and (fixed_area or a.optimal_ratio):
+        base += f"_n{a.n_angles}_a{ratio:.2f}"      # design sweeps get distinct scene names
+    new_scene = a.new_scene or base
     out = a.out or os.path.join("./data/slit_sim", new_scene)
     # dataset_readers / training switch behaviour on these substrings of the data path.
     for bad in ("synthetic", "DoF"):
@@ -232,40 +283,52 @@ def main():
     inv = visible_inverse_depths(gaussians, train_cams, seed=a.seed)
     sub = inv[torch.randperm(inv.numel(), device="cuda")[:5_000_000]]
     inv_far, inv_near = torch.quantile(sub, 0.05).item(), torch.quantile(sub, 0.95).item()
-    slit_gt = None
-    if a.match_slit:
-        with open(os.path.join(a.match_slit, "sim_gt.json")) as f:
-            slit_gt = json.load(f)
-        F = slit_gt["focus_distance"]
+    ref_gt = None
+    if a.match_area:
+        with open(os.path.join(a.match_area, "sim_gt.json")) as f:
+            ref_gt = json.load(f)
+        F = ref_gt["focus_distance"]
+        if a.noise_std != ref_gt["noise_std"]:
+            print(f"[WARN] noise_std {a.noise_std} differs from the reference simulation ({ref_gt['noise_std']}); "
+                  f"an equal-area comparison should use the same noise level.")
     else:
         F = a.focus_depth if a.focus_depth is not None else 1.0 / torch.quantile(sub, a.focus_quantile).item()
     d_max = max(abs(inv_near - 1.0 / F), abs(1.0 / F - inv_far))
     print(f"Scene depth (5-95%): {1/inv_near:.4f} .. {1/inv_far:.4f}, focus F = {F:.4f}")
 
-    if a.aperture == "slit":
-        K_L = a.max_blur_px / d_max      # full PSF length = K * |1/z - 1/F|
-        K_W = a.width_ratio * K_L
-        max_blur = a.max_blur_px
-        print(f"Ground truth: K_L = {K_L:.2f}, K_W = {K_W:.2f} (ratio {a.width_ratio}), "
-              f"max blur {max_blur:.1f} px x {max_blur * a.width_ratio:.2f} px")
-        span = 360.0 if a.full_circle else 180.0
-        angles = [k * span / a.n_angles for k in range(a.n_angles)]
+    # aperture area in K units (K_L * K_W for a slit, pi K_D^2 / 4 for a disk)
+    if ref_gt is not None:
+        area_K = ref_gt.get("aperture_area_K2")
+        if area_K is None:  # datasets written before the area was stored (slit only)
+            area_K = ref_gt["K_long"] * ref_gt["K_short"]
+        print(f"Matching aperture area of {a.match_area} ({ref_gt.get('aperture', 'slit')}): A = {area_K:.1f} K^2")
+    elif a.area_px2 is not None:
+        area_K = a.area_px2 / d_max ** 2
     else:
-        if slit_gt is not None:
-            K_L = 2.0 * math.sqrt(slit_gt["K_long"] * slit_gt["K_short"] / math.pi)
-            if a.noise_std != slit_gt["noise_std"]:
-                print(f"[WARN] noise_std {a.noise_std} differs from the slit simulation ({slit_gt['noise_std']}); "
-                      f"an equal-area comparison should use the same noise level.")
+        area_K = None
+
+    if a.aperture == "slit":
+        if area_K is not None:
+            K_L = math.sqrt(area_K / ratio)
         else:
-            K_L = a.max_blur_px / d_max
+            K_L = a.max_blur_px / d_max  # full PSF length = K * |1/z - 1/F|
+        K_W = ratio * K_L
+        max_blur = K_L * d_max
+        print(f"Ground truth (slit): n = {len(angles)}, ratio a = {ratio:.4f}"
+              f"{' (optimal tan(%.2f deg))' % max_offset_deg(angles) if a.optimal_ratio else ''}, "
+              f"K_L = {K_L:.2f}, K_W = {K_W:.2f}, max blur {max_blur:.2f} px x {max_blur * ratio:.2f} px")
+        th = theory_summary(ratio, angles)
+        print(f"Theory vs equal-area disk: worst-direction variance ratio {th['worst_var_ratio']:.3f}, "
+              f"DOF gain {th['dof_gain_worst']:.2f}x")
+    else:
+        K_L = 2.0 * math.sqrt(area_K / math.pi) if area_K is not None else a.max_blur_px / d_max
         K_W = K_L
         max_blur = K_L * d_max
         print(f"Ground truth (disk): K_D = {K_L:.2f}, max blur diameter {max_blur:.2f} px"
-              + (f"  [equal area to slit {slit_gt['K_long']:.1f} x {slit_gt['K_short']:.1f}]" if slit_gt else ""))
-        angles = [0.0] * a.disk_copies
+              + (" [equal area]" if area_K is not None else ""))
     if K_L < K_MIN_REPRESENTABLE:
         print(f"[WARN] K = {K_L:.1f} is below the smallest K the model can represent ({K_MIN_REPRESENTABLE:.0f}); "
-              f"the model cannot fit it. Increase the blur (--max_blur_px, or a larger slit in --match_slit).")
+              f"the model cannot fit it. Use a larger blur or area.")
 
     # ---- output folders ----
     if os.path.exists(out):
@@ -338,7 +401,11 @@ def main():
               theta_bias_deg=a.theta_bias_deg if a.aperture == "slit" else 0.0,
               max_blur_px=max_blur, noise_std=a.noise_std, aperture_coeff=gaussians.aperture_coeff,
               aperture_area_K2=(K_L * K_W if a.aperture == "slit" else math.pi * K_L ** 2 / 4),
-              matched_slit=a.match_slit, n_train_poses=len(train_cams), n_test_poses=len(test_cams))
+              aperture_area_px2_at_max_defocus=((K_L * K_W if a.aperture == "slit" else math.pi * K_L ** 2 / 4)
+                                                * d_max ** 2),
+              d_max=d_max, matched_area_of=a.match_area, ratio_is_optimal=(a.aperture == "slit" and a.optimal_ratio),
+              theory=(theory_summary(K_W / K_L, angles) if a.aperture == "slit" else None),
+              n_train_poses=len(train_cams), n_test_poses=len(test_cams))
     with open(os.path.join(out, "sim_gt.json"), "w") as f:
         json.dump(gt, f, indent=2)
 
@@ -352,7 +419,11 @@ def main():
     if a.aperture == "slit":
         new_conf.aperture_type = "slit"
         new_conf.slit_angle_file = ""    # -> <source_path>/slit_angles.json
-        new_conf.slit_width_ratio = 0.2  # deliberately different from the ground truth
+        if fixed_area and not a.learn_ratio:
+            new_conf.slit_width_ratio = float(ratio)   # known slit geometry: keep it fixed
+            new_conf.slit_ratio_lr = 0.0
+        else:
+            new_conf.slit_width_ratio = 0.2            # deliberately different from the ground truth
         new_conf.slit_share_F = True
         new_conf.slit_share_K = True
         new_conf.slit_learn_theta_offset = True
@@ -360,6 +431,7 @@ def main():
         new_conf.aperture_type = "disk"  # original DOF-GS model
         for k in [k for k in new_conf.keys() if str(k).startswith("slit_")]:
             new_conf.pop(k)
+    new_conf.slit_group_by_pose = bool(a.group_by_pose)
     cfg_path = os.path.join("config_files", f"config_{new_scene}.yaml")
     OmegaConf.save(new_conf, cfg_path)
 

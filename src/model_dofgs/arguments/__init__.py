@@ -67,7 +67,7 @@ class ModelParams(ParamGroup):
         # used for images missing from the angle file.
         self.slit_angle_regex = ''
         # Initial short-axis / long-axis aperture ratio of the slit.
-        self.slit_width_ratio = 0.1
+        self.slit_width_ratio = 0.4
         # Share one focus distance / aperture scale across all views (same lens
         # setting for the whole capture). Set to false to learn them per view.
         self.slit_share_F = True
@@ -112,6 +112,10 @@ class OptimizationParams(ParamGroup):
         self.kapert_lr = 0.01
         self.slit_ratio_lr = 0.01
         self.slit_theta_lr = 0.001
+        # Each iteration renders all images that share one camera pose (e.g. the
+        # n slit angles) and averages their losses. False: one image per
+        # iteration, as in the original DOF-GS.
+        self.slit_group_by_pose = False
         self.random_background = False
         self.iter_defocus_start = 100
         self.num_extra_points = 100000

@@ -54,3 +54,19 @@ slitsim_real_cake:
 disksim_real_cake:
   source_path: ./data/slit_sim/disksim_real_cake
   holdout: 8
+
+slitsim_real_cake_n4_a0.41:
+  source_path: ./data/slit_sim/slitsim_real_cake_n4_a0.41
+  holdout: 8
+
+slitsim_real_cake_n8_a0.20:
+  source_path: ./data/slit_sim/slitsim_real_cake_n8_a0.20
+  holdout: 8
+
+slitsim_real_cake_n12_a0.13:
+  source_path: ./data/slit_sim/slitsim_real_cake_n12_a0.13
+  holdout: 8
+
+slitsim_real_cake_n4_a0.40:
+  source_path: ./data/slit_sim/slitsim_real_cake_n4_a0.40
+  holdout: 8

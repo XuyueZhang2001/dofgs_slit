@@ -61,3 +61,4 @@ band_limit: true
 lambda_mask_loss: 0.002
 images: images
 aperture_type: disk
+slit_group_by_pose: false

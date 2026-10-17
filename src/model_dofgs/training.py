@@ -14,7 +14,7 @@ from src.metrics import compute_img_metric
 import imageio.v2 as imageio
 import numpy as np
 import math
-from src.utils.slit_utils import load_slit_angles
+from src.utils.slit_utils import load_slit_angles, group_views_by_pose
    
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -138,6 +138,15 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
                                     dataset.source_path, mask_act='sigmoid', COC_MAX=dataset.coc_max,
                                     slit_cfg=slit_cfg)
     scene.gaussians = gaussians
+
+    # Optional pose-grouped iterations: all images sharing one camera pose
+    # (e.g. the n slit angles) are rendered in the same iteration.
+    group_by_pose = bool(getattr(opt, 'slit_group_by_pose', False))
+    pose_groups = [[cam for _, cam in g] for g in group_views_by_pose(scene.getTrainCameras())]
+    pose_stack = []
+    if group_by_pose:
+        sizes = sorted({len(g) for g in pose_groups})
+        print(f'Pose-grouped training: {len(pose_groups)} poses, images per pose: {sizes}')
     
     # Set up training stuffs, such as optimizers
     gaussians.training_setup(opt)
@@ -181,77 +190,96 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # if the viewpoint stack has been traversed, update it, i.e., make sure that viewpoint stack is not None
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        
-        
-        # randomly pick an viewpoint
-        select_index = randint(0, len(viewpoint_stack)-1)
-        viewpoint_cam = viewpoint_stack.pop(select_index)   
-        select_cam_index = mapping_dict[viewpoint_cam.image_name]
+        if group_by_pose:
+            # randomly pick a pose (without replacement within an epoch) and use all its images
+            if not pose_stack:
+                pose_stack = list(pose_groups)
+            views = pose_stack.pop(randint(0, len(pose_stack)-1))
+        else:
+            # if the viewpoint stack has been traversed, update it, i.e., make sure that viewpoint stack is not None
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+            # randomly pick an viewpoint
+            select_index = randint(0, len(viewpoint_stack)-1)
+            views = [viewpoint_stack.pop(select_index)]
         
         # Render
         if (ori_iter - 1) == debug_from:
             pipe.debug = True
 
         bg = torch.rand((3), device=device) if opt.random_background else background
-        
-        
-        #print(f'selct_index: {select_cam_index:d} and view.image_name: {viewpoint_cam.image_name}')
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, select_view=select_cam_index, 
-                            tone_map=tone_map, band_limit=opt.band_limit, kernel_size=opt.kernel_size)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], \
-                            render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        n_views = len(views)
+        loss_sum = 0.0
+        rendered_aif = None     # in pose-grouped mode the AiF render is shared by all images of the pose
+        for view_i, viewpoint_cam in enumerate(views):
+            last_view = view_i == n_views - 1
+            select_cam_index = mapping_dict[viewpoint_cam.image_name]
 
-        # Loss
-        gt_image = viewpoint_cam.original_image.to(device)
+            render_pkg = render(viewpoint_cam, gaussians, pipe, bg, select_view=select_cam_index, 
+                                tone_map=tone_map, band_limit=opt.band_limit, kernel_size=opt.kernel_size)
+            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], \
+                                render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        # if we start using in-focus loss to jointly optimize defocused and AiF images.
-        if ori_iter > opt.infocus_start_iter:
-            # render AiF image using an valid_K (aperture) that is set to zero.
-            rendered_aif = render(viewpoint_cam, gaussians, pipe, bg, valid_F, valid_K, tone_map=tone_map, 
-                                band_limit=opt.band_limit, kernel_size=opt.kernel_size)
-            raii = rendered_aif['radii']
-            coc_alpha = render_pkg['coc_alpha'] # get the coc map
-            aif_img = rendered_aif['render'] # get the all-in-focus image
-            aif_depth = rendered_aif['depth'] # fetch the all-in-focus depth image
-            blur_depth = render_pkg['depth'] # fetch the depth rendered with coc > 0
+            # Loss
+            gt_image = viewpoint_cam.original_image.to(device)
 
-            # normalization
-            norm_depth = (blur_depth - blur_depth.min()) / (blur_depth.max() - blur_depth.min() + 1e-5)
-            norm_coc = (coc_alpha - coc_alpha.min()) / (coc_alpha.max() - coc_alpha.min() + 1e-5)
+            # if we start using in-focus loss to jointly optimize defocused and AiF images.
+            if ori_iter > opt.infocus_start_iter:
+                # render AiF image using an valid_K (aperture) that is set to zero.
+                if rendered_aif is None:
+                    rendered_aif = render(viewpoint_cam, gaussians, pipe, bg, valid_F, valid_K, tone_map=tone_map, 
+                                        band_limit=opt.band_limit, kernel_size=opt.kernel_size)
+                raii = rendered_aif['radii']
+                coc_alpha = render_pkg['coc_alpha'] # get the coc map
+                aif_img = rendered_aif['render'] # get the all-in-focus image
+                aif_depth = rendered_aif['depth'] # fetch the all-in-focus depth image
+                blur_depth = render_pkg['depth'] # fetch the depth rendered with coc > 0
+
+                # normalization
+                norm_depth = (blur_depth - blur_depth.min()) / (blur_depth.max() - blur_depth.min() + 1e-5)
+                norm_coc = (coc_alpha - coc_alpha.min()) / (coc_alpha.max() - coc_alpha.min() + 1e-5)
             
-            # predict out-of-focus mask
-            infocus_mask = gaussians.mask_net(select_cam_index, pos_enc,
-                                                torch.cat([image, norm_depth], dim=-3).detach(), norm_coc.detach())
+                # predict out-of-focus mask
+                infocus_mask = gaussians.mask_net(select_cam_index, pos_enc,
+                                                    torch.cat([image, norm_depth], dim=-3).detach(), norm_coc.detach())
             
-            log_coc = torch.log1p(coc_alpha.detach())
-            infocus_mask_coc = (log_coc - log_coc.min()) / (torch.abs(log_coc.max() - log_coc.min()) + 1e-5)    
-            if opt.use_mask_loss:
-                mask_loss = opt.lambda_mask_loss * (pearson_mask_loss(infocus_mask.squeeze(), infocus_mask_coc.squeeze())) 
-                mask_reg_loss = (-1.0) * opt.lambda_mask_loss * 0.1 * ((infocus_mask * torch.log(infocus_mask + 1e-6)).mean())  # regularizer 
-                maskloss = mask_loss + mask_reg_loss
-            else:
-                maskloss = 0.0
+                log_coc = torch.log1p(coc_alpha.detach())
+                infocus_mask_coc = (log_coc - log_coc.min()) / (torch.abs(log_coc.max() - log_coc.min()) + 1e-5)    
+                if opt.use_mask_loss:
+                    mask_loss = opt.lambda_mask_loss * (pearson_mask_loss(infocus_mask.squeeze(), infocus_mask_coc.squeeze())) 
+                    mask_reg_loss = (-1.0) * opt.lambda_mask_loss * 0.1 * ((infocus_mask * torch.log(infocus_mask + 1e-6)).mean())  # regularizer 
+                    maskloss = mask_loss + mask_reg_loss
+                else:
+                    maskloss = 0.0
                                        
-            blur_img1 = (1.0 - infocus_mask) * aif_img.detach() + infocus_mask * image
-            loss_defocus = ((1.0 - opt.lambda_dssim) * l1_loss(blur_img1, gt_image) 
-                    + opt.lambda_dssim * (1.0 - ssim(blur_img1, gt_image)))
-            loss_defocus.backward(retain_graph=True) 
+                blur_img1 = (1.0 - infocus_mask) * aif_img.detach() + infocus_mask * image
+                loss_defocus = ((1.0 - opt.lambda_dssim) * l1_loss(blur_img1, gt_image) 
+                        + opt.lambda_dssim * (1.0 - ssim(blur_img1, gt_image)))
+                (loss_defocus / n_views).backward(retain_graph=True) 
                 
-            blur_img2 = (1.0 - infocus_mask) * aif_img + infocus_mask * image.detach()   # this is the image blended with the rendered blurry image and aif rendering
-            loss_aif = ((1.0 - opt.lambda_dssim) * l1_loss(blur_img2, gt_image) 
-                    + opt.lambda_dssim * (1.0 - ssim(blur_img2, gt_image))) 
-            loss = opt.lambda_infocus * loss_aif + maskloss
-            loss.backward()
+                blur_img2 = (1.0 - infocus_mask) * aif_img + infocus_mask * image.detach()   # this is the image blended with the rendered blurry image and aif rendering
+                loss_aif = ((1.0 - opt.lambda_dssim) * l1_loss(blur_img2, gt_image) 
+                        + opt.lambda_dssim * (1.0 - ssim(blur_img2, gt_image))) 
+                loss = opt.lambda_infocus * loss_aif + maskloss
+                # the shared AiF graph must survive until the last image of the pose
+                (loss / n_views).backward(retain_graph=not last_view)
 
-        else:
-            Ll1 = l1_loss(image, gt_image)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))  
-            loss.backward()
+            else:
+                Ll1 = l1_loss(image, gt_image)
+                loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))  
+                (loss / n_views).backward()
 
+            loss_sum += loss.item() / n_views
+
+            # densification statistics are collected for every rendered image
+            if iteration < opt.densify_until_iter:
+                with torch.no_grad():
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+        # mean loss over the images of this iteration (a single image unless pose-grouped)
+        loss = torch.tensor(loss_sum, device=device)
 
         iter_end.record()
 
@@ -291,9 +319,7 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
             ### Densification
             is_gs_densified = False   # a value that will specified as True after Gaussians are densified
             if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                # max radii and gradient statistics were accumulated per image above
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if (iteration > opt.opacity_reset_interval and opt.use_size_prune) else None
