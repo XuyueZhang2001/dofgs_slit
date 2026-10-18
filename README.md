@@ -236,23 +236,64 @@ python train.py --config ./config_files/config_disksim_real_cake.yaml
 
 The outputs go to `./output/model_dofgs/<model_folder>/<scene>/`. To run a variant on the same data, such as a fixed width ratio, copy the config, change the parameters, and set a different `model_folder` so that runs do not overwrite each other.
 
-### 4. Evaluate AIF recovery
+### 4. Evaluate image and 3D recovery
 
 ```shell
-python tools/eval_slit_recovery.py --config ./config_files/config_slitsim_real_cake.yaml \
-    --scene slitsim_real_cake --iteration 40000 --save_images
+python tools/eval_slit_recovery.py --config ./config_files/config_slitsim_real_cake_n4_a0.40.yaml \
+    --scene slitsim_real_cake_n4_a0.40 --iteration 40000 --save_images
 ```
 
-The script reports PSNR, SSIM (same implementation as DOF-GS) and LPIPS (if `pip install lpips` is available) for the following comparisons:
+The same command works for the disk baseline. The ground truth is the simulated dataset plus, for the 3D metrics, the source DOF-GS scene it was simulated from. That scene is found from `sim_gt.json` (`source_scene`, `source_iteration`) and `config_files/config_<source_scene>.yaml`; use `--source_config` to point elsewhere.
 
-| Row | Meaning |
+**Image metrics.** PSNR and SSIM use the same implementation as DOF-GS. LPIPS is added if `pip install lpips` is available.
+
+| Row | Compares | Purpose |
+|---|---|---|
+| train recovered AIF vs AIF GT | AIF render of the trained model at training poses vs ground truth | deblurring at captured poses |
+| train blurred input vs AIF GT | the blurred captures themselves, averaged over angles | baseline: how blurry the data is |
+| train mean of angles vs AIF GT | pixel-wise mean of the images of a pose | baseline: naive multi-angle fusion |
+| train re-rendered blur vs input | blurred images re-rendered with the learned optics vs the inputs | data fit (not recovery) |
+| **test recovered AIF vs AIF GT** | AIF render at held-out poses vs ground truth | **main result** (novel view + deblurring) |
+
+The script also prints the AIF PSNR gain over the blurred inputs.
+
+**3D metrics (A: depth).** The AIF depth of the trained model is compared with that of the source scene at every training pose and test pose. Depth is the alpha-normalised camera distance from the rasterizer.
+
+| Metric | Meaning | Better |
+|---|---|---|
+| `abs_rel` | mean \|d − d\*\| / d\* | lower |
+| `rmse` | depth RMSE (scene units) | lower |
+| `rmse_inv` | RMSE of inverse depth 1/d (directly related to defocus) | lower |
+| `delta1` | fraction of pixels with max(d/d\*, d\*/d) < 1.25 | higher |
+| `coverage` | fraction of valid GT pixels that are also valid in the reconstruction | higher |
+
+AbsRel is also reported per relative-defocus bin, `|1/z − 1/F| / d_max` in `[0,0.25)`, `[0.25,0.5)`, `[0.5,1)` and `≥1`, together with the pixel fraction of each bin. The bins depend only on scene depth, so slit and disk can be compared bin by bin.
+
+**3D metrics (B: point cloud).** The centres of opaque (opacity > 0.5), visible Gaussians of the trained model are compared with those of the source scene. Both models share the same COLMAP frame, so no alignment is needed.
+
+| Metric | Meaning | Better |
+|---|---|---|
+| `accuracy` | mean distance from reconstructed points to the nearest GT point | lower |
+| `completeness` | mean distance from GT points to the nearest reconstructed point | lower |
+| `chamfer` | mean of accuracy and completeness | lower |
+| `precision` / `recall` / `F-score` @ τ | fraction of points within τ, for τ = 0.2 %, 0.5 % and 1 % of the GT bounding-box diagonal | higher |
+
+| Option | Meaning |
 |---|---|
-| recovered AIF vs AIF GT | the main result |
-| slit input vs AIF GT | baseline: the blurred captures themselves |
-| mean of angles vs AIF GT | baseline: naive multi-angle averaging |
-| re-rendered vs input | how well the learned defocus model fits the data |
+| `--no_3d` | skip the depth and point-cloud evaluation |
+| `--source_config` | config of the source DOF-GS scene (ground truth for 3D) |
+| `--opacity_thresh` | opacity threshold for the point cloud (default 0.5) |
+| `--pc_max_points` | random subsample per point cloud for the nearest-neighbour search (default 500k) |
+| `--fscore_tau` | F-score thresholds as fractions of the GT bounding-box diagonal |
 
-Results are written to `<model_path>/eval_slit_recovery/iteration_<N>/`: `summary.json`, `per_view.csv`, and `strips/` showing GT | input | mean | recovered side by side. The same command works for the disk baseline.
+Results are written to `<model_path>/eval_slit_recovery/iteration_<N>/`:
+- `summary.json`: the means of all metrics, under `summary.{train,test}.{recovered,input,mean,refit,depth,depth_by_defocus}` and `summary.geometry`, together with the design (`design`) and theory prediction (`theory`);
+- `per_view.csv` and `per_view_depth.csv`: per-view image and depth metrics;
+- `strips/`: GT | input | mean | recovered side by side (only with `--save_images`).
+
+`run_design_sweep.py` skips evaluations whose `summary.json` already exists. To add the 3D metrics to an older evaluation, run the command above directly; no retraining is needed.
+
+DOF-GS itself reports only PSNR and SSIM of AIF renders. The depth and point-cloud metrics are an addition of this repository.
 
 ### 5. Compare recovered optics (slit models)
 
@@ -279,7 +320,7 @@ This prints the estimated and ground-truth `F`, `K_L`, `K_W`, width ratio and an
 ```
 tools/
   simulate_slit_dataset.py   slit / equal-area disk dataset simulation from a trained DOF-GS scene
-  eval_slit_recovery.py      AIF recovery metrics and baselines
+  eval_slit_recovery.py      image (AIF), depth and point-cloud metrics with baselines
   compare_slit_params.py     recovered vs ground-truth optics
   aperture_theory.py         equal-area slit vs disk theory (optimal ratio, DOF gain, SNR gain)
   run_design_sweep.py        simulate -> train -> evaluate for several (n, a) designs
