@@ -17,11 +17,23 @@ Training modes
                       updates as in an n = ref_n run (off by default; the disk
                       baseline always keeps the base schedule).
 
+Sensor noise (off by default)
+  --noise_std s       additive Gaussian noise with std s on every defocused training
+                      capture (images in [0, 1], e.g. 0.01 = 1 % of full scale),
+                      independent per image; all-in-focus references and test views
+                      stay clean. Noisy runs get the suffix _noise<s>.
+  --disk_copies       captures per pose of the disk baseline. Default: with noise,
+                      the slit n (same number of captures as the slit, each copy with
+                      its own noise); without noise, 1 (identical copies add nothing,
+                      so the existing noise-free disk run is reused).
+
 Usage (from the repository root, e.g. inside tmux):
     python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
         --scene real_cake --iteration 15000 --gpu 1                    # default design 4:0.4 + disk
     python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
         --scene real_cake --iteration 15000 --gpu 1 --designs 4:0.1 4:0.4 8:0.2 12:0.13
+    python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+        --scene real_cake --iteration 15000 --gpu 1 --noise_std 0.01   # slit n=4 a=0.4 vs disk x4, noisy
 """
 import argparse
 import json
@@ -58,9 +70,12 @@ def parse_args():
                         "(default ./data/slit_sim/slitsim_<scene>)")
     p.add_argument("--designs", nargs="+", default=["4:0.4"], help="designs as n:a, e.g. 4:0.4 8:0.2")
     p.add_argument("--no_disk", action="store_true", help="skip the equal-area disk baseline")
-    p.add_argument("--disk_copies", type=int, default=1,
-                   help="images per pose for the disk (use n when noise is added, equal number of captures)")
-    p.add_argument("--noise_std", type=float, default=0.0)
+    p.add_argument("--disk_copies", type=int, default=None,
+                   help="captures per pose for the disk baseline; default: the slit n when --noise_std > 0 "
+                        "(equal number of captures), otherwise 1")
+    p.add_argument("--noise_std", type=float, default=0.0,
+                   help="std of additive Gaussian noise on the [0, 1] training captures "
+                        "(default 0 = noise-free; e.g. 0.01 = 1%% of full scale)")
     p.add_argument("--train_mode", choices=["per_view", "per_pose"], default="per_view")
     p.add_argument("--scale_iterations", action="store_true",
                    help="scale the iteration schedule by images-per-pose / ref_n (off by default)")
@@ -71,7 +86,28 @@ def parse_args():
                    choices=["simulate", "train", "eval"])
     p.add_argument("--save_images", action="store_true", help="pass --save_images to the evaluation")
     p.add_argument("--dry_run", action="store_true", help="print the commands without running them")
-    return p.parse_args()
+    a = p.parse_args()
+    if a.noise_std < 0:
+        p.error("--noise_std must be >= 0")
+    if a.disk_copies is not None and a.disk_copies < 1:
+        p.error("--disk_copies must be >= 1")
+    return a
+
+
+def resolve_disk_copies(a, slit_ns):
+    """Captures per pose of the disk baseline (see the module docstring)."""
+    if a.disk_copies is not None:
+        if a.disk_copies > 1 and a.noise_std == 0:
+            print(f"[WARN] {a.disk_copies} noise-free disk copies per pose are identical images.")
+        return a.disk_copies
+    if a.noise_std == 0:
+        return 1
+    ns = sorted(set(slit_ns))
+    if len(ns) == 1:
+        return ns[0]
+    print(f"[INFO] designs use different n {ns}; the disk is captured ref_n = {a.ref_n} times per pose "
+          f"(pass --disk_copies to choose another count).")
+    return a.ref_n
 
 
 # ---------------------------------------------------------------------------
@@ -160,19 +196,23 @@ def main():
         raise SystemExit(f"Reference dataset {ref} not found; pass --match_area <simulated dataset folder>.")
     ref_area = area_of(ref)
     env = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": str(a.gpu)}
-    if a.noise_std > 0 and a.disk_copies == 1 and not a.no_disk:
-        print("[WARN] noise is added but the disk uses 1 image per pose; use --disk_copies n for equal captures.")
 
     # (scene name, simulate arguments, images per pose)
-    jobs = []
+    jobs, slit_ns = [], []
     for d in a.designs:
         n_str, r_str = d.split(":")
         n, r = int(n_str), float(r_str)
+        slit_ns.append(n)
         name = f"slitsim_{a.scene}_n{n}_a{r:.2f}{tag}"
         jobs.append((name, ["--n_angles", str(n), "--width_ratio", str(r)], n))
     if not a.no_disk:
-        name = f"disksim_{a.scene}" + (f"_c{a.disk_copies}" if a.disk_copies > 1 else "") + tag
-        jobs.append((name, ["--aperture", "disk", "--disk_copies", str(a.disk_copies)], a.disk_copies))
+        copies = resolve_disk_copies(a, slit_ns)
+        if a.noise_std > 0 and copies not in slit_ns:
+            print(f"[WARN] the disk uses {copies} capture(s) per pose but the slit designs use n = "
+                  f"{sorted(set(slit_ns))}; the number of captures is not equal.")
+        print(f"Noise std {a.noise_std:g}; disk captures per pose: {copies}")
+        name = f"disksim_{a.scene}" + (f"_c{copies}" if copies > 1 else "") + tag
+        jobs.append((name, ["--aperture", "disk", "--disk_copies", str(copies)], copies))
 
     for name, sim_args, per_pose in jobs:
         is_slit = name.startswith("slitsim_")
