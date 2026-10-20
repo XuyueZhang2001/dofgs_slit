@@ -15,6 +15,7 @@ import imageio.v2 as imageio
 import numpy as np
 import math
 from src.utils.slit_utils import load_slit_angles, group_views_by_pose
+from src.utils.directional_loss import slit_directional_aif_loss
    
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -147,6 +148,18 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
     if group_by_pose:
         sizes = sorted({len(g) for g in pose_groups})
         print(f'Pose-grouped training: {len(pose_groups)} poses, images per pose: {sizes}')
+
+    # Directional AiF loss (slit only). It needs the AiF render, so it never starts
+    # before infocus_start_iter.
+    dir_weight = float(getattr(opt, 'slit_dir_loss', 0.0)) if slit_cfg is not None else 0.0
+    dir_start = max(int(getattr(opt, 'slit_dir_start_iter', -1)), int(opt.infocus_start_iter))
+    dir_warmup = max(int(getattr(opt, 'slit_dir_warmup', 0)), 1)
+    dir_stats = {'loss': 0.0, 'coverage': 0.0, 'ratio': 0.0}   # EMAs for logging
+    if dir_weight > 0:
+        print(f'Directional slit AiF loss: weight {dir_weight:g} from iteration {dir_start} '
+              f'(warm-up {dir_warmup}), sigma_W < {opt.slit_dir_sigma_w_max:g} px, '
+              f'sigma_L <= {opt.slit_dir_sigma_l_max:g} px, '
+              f'smoothing std {opt.slit_dir_smooth_mult * opt.slit_dir_sigma_l_max:g} px along the long axis')
     
     # Set up training stuffs, such as optimizers
     gaussians.training_setup(opt)
@@ -259,9 +272,25 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
                 (loss_defocus / n_views).backward(retain_graph=True) 
                 
                 blur_img2 = (1.0 - infocus_mask) * aif_img + infocus_mask * image.detach()   # this is the image blended with the rendered blurry image and aif rendering
-                loss_aif = ((1.0 - opt.lambda_dssim) * l1_loss(blur_img2, gt_image) 
-                        + opt.lambda_dssim * (1.0 - ssim(blur_img2, gt_image))) 
+                loss_aif = ((1.0 - opt.lambda_dssim) * l1_loss(blur_img2, gt_image)
+                        + opt.lambda_dssim * (1.0 - ssim(blur_img2, gt_image)))
                 loss = opt.lambda_infocus * loss_aif + maskloss
+
+                # Directional AiF constraint across the short slit axis (gradients reach the AiF render only).
+                if dir_weight > 0 and ori_iter > dir_start:
+                    w_dir = dir_weight * min(1.0, (ori_iter - dir_start) / dir_warmup)
+                    theta_view = float(gaussians.get_defocus_params()[3][select_cam_index].detach())
+                    loss_dir, coverage = slit_directional_aif_loss(
+                        aif_img, gt_image, coc_alpha.detach(), theta_view,
+                        ratio=gaussians.slit_width_ratio(), coeff=gaussians.aperture_coeff,
+                        sigma_w_max=opt.slit_dir_sigma_w_max, sigma_l_max=opt.slit_dir_sigma_l_max,
+                        smooth_mult=opt.slit_dir_smooth_mult)
+                    loss = loss + w_dir * loss_dir
+                    # logging: weighted directional term relative to the AiF data term
+                    rel = (w_dir * loss_dir.item()) / max(opt.lambda_infocus * loss_aif.item(), 1e-12)
+                    dir_stats['loss'] = 0.4 * loss_dir.item() + 0.6 * dir_stats['loss']
+                    dir_stats['coverage'] = 0.4 * coverage + 0.6 * dir_stats['coverage']
+                    dir_stats['ratio'] = 0.4 * rel + 0.6 * dir_stats['ratio']
                 # the shared AiF graph must survive until the last image of the pose
                 (loss / n_views).backward(retain_graph=not last_view)
 
@@ -289,8 +318,15 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
 
             if ori_iter % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                postfix = {"Loss": f"{ema_loss_for_log:.{7}f}"}
+                if dir_weight > 0 and ori_iter > dir_start:
+                    postfix["Ldir"] = f"{dir_stats['loss']:.5f}"
+                progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
+                if tb_writer and dir_weight > 0 and ori_iter > dir_start:
+                    tb_writer.add_scalar('train_loss_patches/slit_dir_loss', dir_stats['loss'], ori_iter)
+                    tb_writer.add_scalar('train_loss_patches/slit_dir_coverage', dir_stats['coverage'], ori_iter)
+                    tb_writer.add_scalar('train_loss_patches/slit_dir_rel_to_aif', dir_stats['ratio'], ori_iter)
 
             if ori_iter == total_iterations:
                 progress_bar.close()
@@ -313,6 +349,10 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
                 if gaussians.aperture_type == 'slit':
                     print(f"[ITER {ori_iter}] slit width ratio: {gaussians.slit_width_ratio():.4f}, "
                           f"theta offset: {math.degrees(gaussians.theta_offset.item()):.3f} deg")
+                    if dir_weight > 0 and ori_iter > dir_start:
+                        print(f"[ITER {ori_iter}] directional AiF loss {dir_stats['loss']:.5f}, "
+                              f"mask coverage {dir_stats['coverage']:.3f}, "
+                              f"weighted / AiF loss {dir_stats['ratio']:.3f}")
 
             
 

@@ -37,6 +37,14 @@ Exposure (only matters with noise; see tools/simulate_slit_dataset.py)
                       (default disk captures 1 in this mode). Exposure-reduced runs
                       get the suffix _e<e>_<scaling>.
 
+Directional AiF loss (slit only; src/utils/directional_loss.py)
+  --dir_loss w [w ...]
+                      weight(s) of the directional all-in-focus loss. Default: the
+                      default of OptimizationParams.slit_dir_loss. Every value is trained
+                      and evaluated on the same simulated dataset; a weight > 0 adds the
+                      suffix _dir<w> to the model_folder (e.g. slit_sim_dir0.1), and
+                      0 reproduces the original model in the unsuffixed folder.
+
 Usage (from the repository root, e.g. inside tmux):
     python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
         --scene real_cake --iteration 15000 --gpu 1                    # default design 4:0.4 + disk
@@ -47,6 +55,8 @@ Usage (from the repository root, e.g. inside tmux):
     python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
         --scene real_cake --iteration 15000 --gpu 1 --noise_std 0.01 \
         --equal_total_exposure --noise_scaling read                     # slit 4 x 0.25 vs disk 1 x 1.0
+    python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+        --scene real_cake --iteration 15000 --gpu 1 --no_disk --dir_loss 0.03 0.1 0.3
 """
 import argparse
 import json
@@ -97,6 +107,9 @@ def parse_args():
                    help="noise growth for exposure e < 1: read -> s / e, shot -> s / sqrt(e)")
     p.add_argument("--equal_total_exposure", action="store_true",
                    help="slit: n captures at exposure 1/n; disk: 1 capture at exposure 1 (equal total time)")
+    p.add_argument("--dir_loss", type=float, nargs="+", default=None,
+                   help="weight(s) of the directional slit AiF loss; default: OptimizationParams default, "
+                        "0 = original model")
     p.add_argument("--train_mode", choices=["per_view", "per_pose"], default="per_view")
     p.add_argument("--scale_iterations", action="store_true",
                    help="scale the iteration schedule by images-per-pose / ref_n (off by default)")
@@ -181,7 +194,7 @@ def optimization_defaults():
     return vars(OptimizationParams(argparse.ArgumentParser()))
 
 
-def build_variant_config(base_cfg_path, a, images_per_pose, is_slit):
+def build_variant_config(base_cfg_path, a, images_per_pose, is_slit, dir_loss=None):
     """Write the training config of this variant; returns (config path, model_folder, final iteration)."""
     conf = OmegaConf.load(base_cfg_path)
     defaults = optimization_defaults()
@@ -189,6 +202,11 @@ def build_variant_config(base_cfg_path, a, images_per_pose, is_slit):
     conf.slit_group_by_pose = a.train_mode == "per_pose"
     if a.train_mode == "per_pose":
         parts.append("perpose")
+    if is_slit and dir_loss is not None:
+        # explicit weight in the config, so the run does not depend on the code default
+        conf.slit_dir_loss = float(dir_loss)
+        if dir_loss > 0:
+            parts.append(f"dir{dir_loss:g}")
 
     base_iters = int(conf.get("iterations", defaults["iterations"]))
     scale = 1.0
@@ -219,7 +237,8 @@ def build_variant_config(base_cfg_path, a, images_per_pose, is_slit):
     if not parts:
         out_path = base_cfg_path
     else:
-        out_path = base_cfg_path.replace(".yaml", f"__{'_'.join(parts)}.yaml")
+        # e.g. config_slitsim_real_cake_n4_a0.40_dir0.1.yaml
+        out_path = base_cfg_path.replace(".yaml", f"_{'_'.join(parts)}.yaml")
     OmegaConf.save(conf, out_path)
     return out_path, conf.model_folder, final_iter
 
@@ -239,6 +258,10 @@ def main():
         raise SystemExit(f"Reference dataset {ref} not found; pass --match_area <simulated dataset folder>.")
     ref_area = area_of(ref)
     env = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": str(a.gpu)}
+    dir_values = a.dir_loss if a.dir_loss is not None else [float(optimization_defaults().get("slit_dir_loss", 0.0))]
+    if any(w < 0 for w in dir_values):
+        raise SystemExit("--dir_loss weights must be >= 0")
+    print(f"Directional AiF loss weight(s) for slit runs: {', '.join(f'{w:g}' for w in dir_values)}")
 
     # (scene name, simulate arguments, images per pose)
     jobs, slit_ns, slit_totals = [], [], []
@@ -289,25 +312,30 @@ def main():
             print("[dry run] config not generated yet; later steps shown with placeholders")
             continue
 
-        cfg, model_folder, final_iter = build_variant_config(base_cfg, a, per_pose, is_slit)
-        model_path = os.path.join("./output/model_dofgs", model_folder, name)
-        tag_run = f"{name}__{model_folder}"
+        # one training run per directional-loss weight for slit datasets, one run for the disk
+        for dir_loss in (dir_values if is_slit else [None]):
+            cfg, model_folder, final_iter = build_variant_config(base_cfg, a, per_pose, is_slit, dir_loss)
+            model_path = os.path.join("./output/model_dofgs", model_folder, name)
+            tag_run = f"{name}_{model_folder}"
+            if dir_loss is not None:
+                print(f"--- directional AiF loss weight {dir_loss:g} -> {model_folder}")
 
-        # ---- train ----
-        ckpt = os.path.join(model_path, "point_cloud", f"iteration_{final_iter}", "point_cloud.ply")
-        if "train" in a.steps and not os.path.isfile(ckpt):
-            run([py, "train.py", "--config", cfg], os.path.join(log_dir, f"{tag_run}_train.log"), env, a.dry_run)
-        elif os.path.isfile(ckpt):
-            print(f"[skip] trained model {ckpt} exists")
+            # ---- train ----
+            ckpt = os.path.join(model_path, "point_cloud", f"iteration_{final_iter}", "point_cloud.ply")
+            if "train" in a.steps and not os.path.isfile(ckpt):
+                run([py, "train.py", "--config", cfg], os.path.join(log_dir, f"{tag_run}_train.log"), env,
+                    a.dry_run)
+            elif os.path.isfile(ckpt):
+                print(f"[skip] trained model {ckpt} exists")
 
-        # ---- evaluate ----
-        summary = os.path.join(model_path, "eval_slit_recovery", f"iteration_{final_iter}", "summary.json")
-        if "eval" in a.steps and not os.path.isfile(summary):
-            run([py, "tools/eval_slit_recovery.py", "--config", cfg, "--scene", name, "--iteration", str(final_iter)]
-                + (["--save_images"] if a.save_images else []),
-                os.path.join(log_dir, f"{tag_run}_eval.log"), env, a.dry_run)
-        elif os.path.isfile(summary):
-            print(f"[skip] evaluation {summary} exists")
+            # ---- evaluate ----
+            summary = os.path.join(model_path, "eval_slit_recovery", f"iteration_{final_iter}", "summary.json")
+            if "eval" in a.steps and not os.path.isfile(summary):
+                run([py, "tools/eval_slit_recovery.py", "--config", cfg, "--scene", name,
+                     "--iteration", str(final_iter)] + (["--save_images"] if a.save_images else []),
+                    os.path.join(log_dir, f"{tag_run}_eval.log"), env, a.dry_run)
+            elif os.path.isfile(summary):
+                print(f"[skip] evaluation {summary} exists")
 
     if not a.dry_run:
         run([py, "tools/collect_design_sweep.py", "--source_scene", a.scene],

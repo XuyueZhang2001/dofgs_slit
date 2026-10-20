@@ -31,11 +31,12 @@ r_W    = 0.5 * K_W * d                    half-length along the slit short axis 
 | `submodules/diff-gaussian-rasterization-dof/` | The forward pass adds the rotated slit covariance, including the off-diagonal term. The backward pass gives analytic gradients w.r.t. `K_L`, `K_W`, θ, `F` and depth. The new inputs (`Kw`, `theta`, `aperture_coeff`) are passed through the C++/Python bindings. In debug mode, kernel launch errors are reported. |
 | `src/model_dofgs/gaussian_model.py` | Slit parameters: `F` and `K_L` (shared or per view), a short/long ratio `K_W / K_L` in (0, 1), the known per-view angles, and an optional global angle offset. All of these are saved in checkpoints. |
 | `src/model_dofgs/renderer/__init__.py` | Passes `K_w` and `slit_theta` to the rasterizer, so any slit angle can be rendered. |
-| `src/model_dofgs/training.py`, `arguments/` | Loads the slit angles and adds the slit configuration options. |
+| `src/model_dofgs/training.py`, `arguments/` | Loads the slit angles and adds the slit configuration options. Adds the directional all-in-focus loss for slit captures (see [Directional all-in-focus loss](#directional-all-in-focus-loss-slit)). |
+| `src/utils/directional_loss.py` | Directional all-in-focus loss: smoothing along the long slit axis, derivative across the short axis, short-axis blur mask. |
 | `src/scene/dataset_readers.py` | Optional `split.json` for an explicit train/test split. |
 | `render.py` | `--slit_sweep` re-renders training views at arbitrary slit angles. |
 | `tools/` | Simulation of slit and equal-area circular-aperture datasets, AIF recovery evaluation, and comparison of recovered optics with ground truth. |
-| `tests/` | GPU smoke test for the rasterizer. |
+| `tests/` | GPU smoke test for the rasterizer; CPU checks of the directional loss. |
 
 ---
 
@@ -338,6 +339,51 @@ This prints the estimated and ground-truth `F`, `K_L`, `K_W`, width ratio and an
 
 ---
 
+## Directional all-in-focus loss (slit)
+
+DOF-GS supervises the all-in-focus (AiF) render directly only where a capture is in focus. Its in-focus mask is computed from the long-axis CoC `r_L`, so for a slit only pixels that are sharp in every direction are used. A slit capture at angle θ, however, is blurred strongly only along the long axis `u = (cos θ, sin θ)`. Along the short axis `v = (−sin θ, cos θ)`, the blur is `r_W = a·r_L`, so the capture still carries the scene detail across `v` over a depth range about `1/a` times larger.
+
+The directional loss uses this detail:
+
+```
+L_dir = || M_W ⊙ ∂_v( G_u * I_AiF − G_u * I_θ ) ||_1
+```
+
+- `G_u` is a 1D Gaussian smoothing along `u`, wider than the long-axis blur. Smoothing both images with it removes their difference along `u` (`G_u * h_u ≈ G_u`). Without it, the loss would push the AiF render to be blurred along `u`. In the frequency domain, only frequencies with small `k_u` (and any `k_v`) are compared. These are the frequencies that the capture reproduces faithfully, whatever the exact long-axis blur.
+- `∂_v` is the derivative across the slit (Sobel, normalised to a per-pixel difference).
+- `M_W` is a soft mask from the rendered CoC map. It keeps pixels with a short-axis blur std `σ_W = a·√c·r_L` below `slit_dir_sigma_w_max`, and a long-axis blur std `σ_L = √c·r_L` at most `slit_dir_sigma_l_max`, so that `G_u` can absorb it. An image border of `3·std(G_u)` is excluded.
+- The capture and the CoC map are treated as constants, so the gradients reach only the AiF render. The loss is averaged over the masked pixels, so its weight does not depend on the mask coverage. Over the n slit angles, it constrains the AiF render along n directions.
+
+The loss is added to the in-focus AiF loss of every slit image after `infocus_start_iter`, with a linear warm-up. It is only used for `aperture_type: slit`; disk training is unchanged.
+
+| Option (`OptimizationParams`) | Default | Meaning |
+|---|---|---|
+| `slit_dir_loss` | 0.1 | weight; 0 disables the loss (original model) |
+| `slit_dir_start_iter` | -1 | start iteration; -1 (or anything earlier) means `infocus_start_iter` |
+| `slit_dir_warmup` | 2000 | iterations of the linear weight ramp |
+| `slit_dir_sigma_w_max` | 1.0 | short-axis blur std threshold of the mask (px) |
+| `slit_dir_sigma_l_max` | 4.0 | largest long-axis blur std absorbed by `G_u` (px) |
+| `slit_dir_smooth_mult` | 2.5 | std of `G_u` = mult × `slit_dir_sigma_l_max` |
+
+During training, the progress bar shows `Ldir`. At every save, the training prints the loss, the mask coverage, and the ratio of the weighted term to the AiF loss. TensorBoard logs the same values.
+
+**Weight sweep on an existing dataset** (no new simulation, no disk retraining):
+
+```shell
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --no_disk --dir_loss 0.03 0.1 0.3
+```
+
+Each weight `w > 0` is trained into `./output/model_dofgs/slit_sim_dir<w>/<scene>/`. `--dir_loss 0` reuses or reproduces the original model in `slit_sim`. Without `--dir_loss`, the sweep uses the code default (0.1). `collect_design_sweep.py` reads the weight from each run's `config_runtime.yaml` and shows it in the `λ_dir` column. A `_dir` run is compared with the disk of the same folder without the suffix. Runs trained before this option existed count as `λ_dir = 0`.
+
+When you run `train.py` by hand on this branch, slit configs use `slit_dir_loss: 0.1` unless the config sets it. Give such runs their own `model_folder`, so that they do not mix with results of the original model.
+
+CPU checks (axis convention, invariance to the long-axis blur, mask, gradients): `python tests/test_directional_loss.py`.
+
+**Limitations.** `G_u * h_u ≈ G_u` is an approximation: the effective widths are `√(σ_u² + σ_L²)` and `σ_u`. Near occlusion boundaries the blur is not shift-invariant. The mask depends on the current depth and `K` estimates.
+
+---
+
 ## Notes and limitations
 
 - **Gaussian PSF approximation.** The rectangular PSF is approximated by an anisotropic Gaussian with matched variance. Sharp edges, sinc zeros of the OTF, diffraction from a narrow slit, and partial occlusion at depth boundaries are not modelled. The simulator uses the same approximation, so simulation results test the optimisation (identifiability, convergence), not model mismatch.
@@ -359,7 +405,9 @@ tools/
   collect_design_sweep.py    results table and measured-vs-theory plot
 tests/
   test_slit_rasterizer.py    rasterizer smoke test (regression, anisotropy, gradients)
+  test_directional_loss.py   CPU checks of the directional all-in-focus loss
 src/utils/slit_utils.py      slit angle loading, grouping of images by camera pose
+src/utils/directional_loss.py  directional all-in-focus loss for slit captures
 ```
 
 ---

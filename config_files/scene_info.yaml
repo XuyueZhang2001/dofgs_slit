@@ -70,3 +70,35 @@ slitsim_real_cake_n12_a0.13:
 slitsim_real_cake_n4_a0.40:
   source_path: ./data/slit_sim/slitsim_real_cake_n4_a0.40
   holdout: 8
+
+slitsim_real_cake_n4_a0.40_noise0.01:
+  source_path: ./data/slit_sim/slitsim_real_cake_n4_a0.40_noise0.01
+  holdout: 8
+
+disksim_real_cake_c4_noise0.01:
+  source_path: ./data/slit_sim/disksim_real_cake_c4_noise0.01
+  holdout: 8
+
+slitsim_real_cake_n4_a0.40_noise0.01_e0.25_shot:
+  source_path: ./data/slit_sim/slitsim_real_cake_n4_a0.40_noise0.01_e0.25_shot
+  holdout: 8
+
+disksim_real_cake_noise0.01:
+  source_path: ./data/slit_sim/disksim_real_cake_noise0.01
+  holdout: 8
+
+slitsim_real_cake_n4_a0.40_noise0.05_e0.25_shot:
+  source_path: ./data/slit_sim/slitsim_real_cake_n4_a0.40_noise0.05_e0.25_shot
+  holdout: 8
+
+disksim_real_cake_noise0.05:
+  source_path: ./data/slit_sim/disksim_real_cake_noise0.05
+  holdout: 8
+
+slitsim_real_cake_n4_a0.40_noise0.05:
+  source_path: ./data/slit_sim/slitsim_real_cake_n4_a0.40_noise0.05
+  holdout: 8
+
+disksim_real_cake_c4_noise0.05:
+  source_path: ./data/slit_sim/disksim_real_cake_c4_noise0.05
+  holdout: 8

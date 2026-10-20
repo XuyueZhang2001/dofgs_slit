@@ -19,6 +19,7 @@ import csv
 import glob
 import json
 import os
+import re
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -64,9 +65,11 @@ def load_rows(a):
         model_path = os.path.dirname(os.path.dirname(os.path.dirname(path)))
         model_folder = os.path.basename(os.path.dirname(model_path))
         aperture = gt.get("aperture", "slit")
+        cfg = load_runtime_config(model_path)
+        # runs trained before the directional loss existed have no key: weight 0
+        dir_loss = float(cfg.get("slit_dir_loss", 0.0)) if aperture == "slit" else None
         design = s.get("design")
         if design is None:   # summaries written before designs were stored
-            cfg = load_runtime_config(model_path)
             design = dict(aperture=aperture, n_angles=len(set(gt["angles_deg"])), width_ratio=gt["width_ratio"],
                           images_per_pose=len(gt["angles_deg"]),
                           group_by_pose=bool(cfg.get("slit_group_by_pose", False)),
@@ -84,6 +87,7 @@ def load_rows(a):
             a=round(design["width_ratio"], 3) if aperture == "slit" else "-",
             images_per_pose=design["images_per_pose"],
             train_mode="per_pose" if design.get("group_by_pose") else "per_view",
+            dir_loss=dir_loss,
             noise=gt.get("noise_std", 0.0),
             # datasets simulated before exposure control used exposure 1 for every capture
             exposure=gt.get("exposure", 1.0),
@@ -120,12 +124,19 @@ def same_capture_budget(d, r):
     return d["exposure"] == 1.0 or d["noise_scaling"] == r["noise_scaling"]
 
 
+def base_model_folder(folder):
+    """model_folder without the directional-loss suffix (slit_sim_dir0.1 -> slit_sim)."""
+    return re.sub(r"_dir[0-9.eE+-]+", "", folder)
+
+
 def add_disk_reference(rows):
     disks = [r for r in rows if r["aperture"] == "disk"]
     for r in rows:
         cands = [d for d in disks if same_capture_budget(d, r)]
+        # prefer the disk of the same folder, then of the same folder without the _dir suffix
         same = [d for d in cands if d["model_folder"] == r["model_folder"]]
-        ref = (same or cands or [None])[0]
+        base = [d for d in cands if d["model_folder"] == base_model_folder(r["model_folder"])]
+        ref = (same or base or cands or [None])[0]
         r["disk_ref"] = f"{ref['model_folder']}/{ref['scene']}" if ref else ""
         ok = ref is not None and r["test_psnr"] is not None and ref["test_psnr"] is not None
         r["delta_test_psnr_vs_disk"] = (r["test_psnr"] - ref["test_psnr"]) if ok else None
@@ -145,7 +156,7 @@ def write_table(rows, out_dir):
     for r in rows:
         r["captures"] = f"{r['images_per_pose']} x {r['exposure']:.4g}"
     cols = [("run", None), ("aperture", "aperture"), ("n", "n"), ("a", "a"), ("train mode", "train_mode"),
-            ("iter", "iteration"), ("noise σ", "noise"), ("captures/pose x exposure", "captures"),
+            ("λ_dir", "dir_loss"), ("iter", "iteration"), ("noise σ", "noise"), ("captures/pose x exposure", "captures"),
             ("total exposure", "total_exposure"), ("σ_eff", "noise_eff"), ("test PSNR", "test_psnr"), ("test SSIM", "test_ssim"),
             ("test LPIPS", "test_lpips"), ("gain over input (dB)", "gain_over_input"),
             ("Δ PSNR vs disk (dB)", "delta_test_psnr_vs_disk"), ("theory DOF gain", "theory_dof_gain"),
@@ -201,6 +212,8 @@ def plot(rows, out_dir, source_scene):
                 label += f", σ={r['noise']:g}"
             if r["exposure"] != 1.0:
                 label += f", e={r['exposure']:.3g} ({r['noise_scaling']})"
+            if r["dir_loss"]:
+                label += f", λ_dir={r['dir_loss']:g}"
             ax.annotate(label, (r["theory_dof_gain"], r["delta_test_psnr_vs_disk"]),
                         textcoords="offset points", xytext=(7, 5), fontsize=8.5, color=INK)
     disk = [r for r in pts if r["aperture"] == "disk"]

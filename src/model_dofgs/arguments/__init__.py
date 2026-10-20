@@ -116,6 +116,15 @@ class OptimizationParams(ParamGroup):
         # n slit angles) and averages their losses. False: one image per
         # iteration, as in the original DOF-GS.
         self.slit_group_by_pose = False
+        # Directional all-in-focus loss for slit captures (src/utils/directional_loss.py):
+        # compare the AiF render and the capture across the short slit axis after
+        # smoothing both along the long axis. Only used for aperture_type 'slit'.
+        self.slit_dir_loss = 0.1            # weight; 0 disables it
+        self.slit_dir_start_iter = -1       # -1: same as infocus_start_iter (never earlier)
+        self.slit_dir_warmup = 2000         # linear ramp of the weight after the start
+        self.slit_dir_sigma_w_max = 1.0     # short-axis blur std threshold (px) of the mask
+        self.slit_dir_sigma_l_max = 4.0     # largest long-axis blur std (px) absorbed by the smoothing
+        self.slit_dir_smooth_mult = 2.5     # smoothing std along the long axis = mult * sigma_l_max
         self.random_background = False
         self.iter_defocus_start = 100
         self.num_extra_points = 100000
