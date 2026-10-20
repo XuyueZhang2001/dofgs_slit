@@ -27,6 +27,16 @@ Sensor noise (off by default)
                       its own noise); without noise, 1 (identical copies add nothing,
                       so the existing noise-free disk run is reused).
 
+Exposure (only matters with noise; see tools/simulate_slit_dataset.py)
+  --slit_exposure e   relative exposure time of every slit capture (default 1)
+  --disk_exposure e   relative exposure time of every disk capture (default 1)
+  --noise_scaling     shot (s / sqrt(e), default) or read (s / e) growth of the noise
+  --equal_total_exposure
+                      equal total exposure time per pose: every slit design is captured
+                      n times at exposure 1 / n, the disk once at exposure 1
+                      (default disk captures 1 in this mode). Exposure-reduced runs
+                      get the suffix _e<e>_<scaling>.
+
 Usage (from the repository root, e.g. inside tmux):
     python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
         --scene real_cake --iteration 15000 --gpu 1                    # default design 4:0.4 + disk
@@ -34,6 +44,9 @@ Usage (from the repository root, e.g. inside tmux):
         --scene real_cake --iteration 15000 --gpu 1 --designs 4:0.1 4:0.4 8:0.2 12:0.13
     python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
         --scene real_cake --iteration 15000 --gpu 1 --noise_std 0.01   # slit n=4 a=0.4 vs disk x4, noisy
+    python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+        --scene real_cake --iteration 15000 --gpu 1 --noise_std 0.01 \
+        --equal_total_exposure --noise_scaling read                     # slit 4 x 0.25 vs disk 1 x 1.0
 """
 import argparse
 import json
@@ -76,6 +89,14 @@ def parse_args():
     p.add_argument("--noise_std", type=float, default=0.0,
                    help="std of additive Gaussian noise on the [0, 1] training captures "
                         "(default 0 = noise-free; e.g. 0.01 = 1%% of full scale)")
+    p.add_argument("--slit_exposure", type=float, default=None,
+                   help="relative exposure time of every slit capture (default 1)")
+    p.add_argument("--disk_exposure", type=float, default=1.0,
+                   help="relative exposure time of every disk capture (default 1)")
+    p.add_argument("--noise_scaling", choices=["read", "shot"], default="shot",
+                   help="noise growth for exposure e < 1: read -> s / e, shot -> s / sqrt(e)")
+    p.add_argument("--equal_total_exposure", action="store_true",
+                   help="slit: n captures at exposure 1/n; disk: 1 capture at exposure 1 (equal total time)")
     p.add_argument("--train_mode", choices=["per_view", "per_pose"], default="per_view")
     p.add_argument("--scale_iterations", action="store_true",
                    help="scale the iteration schedule by images-per-pose / ref_n (off by default)")
@@ -91,7 +112,29 @@ def parse_args():
         p.error("--noise_std must be >= 0")
     if a.disk_copies is not None and a.disk_copies < 1:
         p.error("--disk_copies must be >= 1")
+    if a.equal_total_exposure and a.slit_exposure is not None:
+        p.error("--equal_total_exposure sets the slit exposure to 1/n; do not pass --slit_exposure as well")
+    for k in ("slit_exposure", "disk_exposure"):
+        v = getattr(a, k)
+        if v is not None and v <= 0:
+            p.error(f"--{k} must be > 0")
+    if a.noise_std == 0 and (a.equal_total_exposure or (a.slit_exposure or 1.0) != 1.0 or a.disk_exposure != 1.0):
+        print("[WARN] exposure settings have no effect without noise (--noise_std 0); they are ignored.")
     return a
+
+
+def slit_exposure_for(a, n):
+    """Relative exposure of every capture of a slit design with n angles."""
+    if a.noise_std == 0:
+        return 1.0
+    if a.equal_total_exposure:
+        return 1.0 / n
+    return a.slit_exposure if a.slit_exposure is not None else 1.0
+
+
+def exposure_tag(a, e):
+    """Name suffix of an exposure-reduced (or -increased) noisy run."""
+    return f"_e{e:.4g}_{a.noise_scaling}" if (a.noise_std > 0 and e != 1.0) else ""
 
 
 def resolve_disk_copies(a, slit_ns):
@@ -100,7 +143,7 @@ def resolve_disk_copies(a, slit_ns):
         if a.disk_copies > 1 and a.noise_std == 0:
             print(f"[WARN] {a.disk_copies} noise-free disk copies per pose are identical images.")
         return a.disk_copies
-    if a.noise_std == 0:
+    if a.noise_std == 0 or a.equal_total_exposure:
         return 1
     ns = sorted(set(slit_ns))
     if len(ns) == 1:
@@ -198,21 +241,30 @@ def main():
     env = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": str(a.gpu)}
 
     # (scene name, simulate arguments, images per pose)
-    jobs, slit_ns = [], []
+    jobs, slit_ns, slit_totals = [], [], []
     for d in a.designs:
         n_str, r_str = d.split(":")
         n, r = int(n_str), float(r_str)
+        e = slit_exposure_for(a, n)
         slit_ns.append(n)
-        name = f"slitsim_{a.scene}_n{n}_a{r:.2f}{tag}"
-        jobs.append((name, ["--n_angles", str(n), "--width_ratio", str(r)], n))
+        slit_totals.append(n * e)
+        name = f"slitsim_{a.scene}_n{n}_a{r:.2f}{tag}{exposure_tag(a, e)}"
+        jobs.append((name, ["--n_angles", str(n), "--width_ratio", str(r), "--exposure", repr(e),
+                            "--noise_scaling", a.noise_scaling], n))
+        if a.noise_std > 0:
+            print(f"slit n={n}, a={r:g}: {n} captures x exposure {e:.4g} (total {n * e:.4g} per pose)")
     if not a.no_disk:
         copies = resolve_disk_copies(a, slit_ns)
-        if a.noise_std > 0 and copies not in slit_ns:
-            print(f"[WARN] the disk uses {copies} capture(s) per pose but the slit designs use n = "
-                  f"{sorted(set(slit_ns))}; the number of captures is not equal.")
-        print(f"Noise std {a.noise_std:g}; disk captures per pose: {copies}")
-        name = f"disksim_{a.scene}" + (f"_c{copies}" if copies > 1 else "") + tag
-        jobs.append((name, ["--aperture", "disk", "--disk_copies", str(copies)], copies))
+        e_d = a.disk_exposure if a.noise_std > 0 else 1.0
+        if a.noise_std > 0:
+            print(f"disk: {copies} capture(s) x exposure {e_d:.4g} (total {copies * e_d:.4g} per pose), "
+                  f"noise std {a.noise_std:g}, {a.noise_scaling} scaling")
+            if any(abs(t - copies * e_d) > 1e-6 for t in slit_totals):
+                print(f"[WARN] the total exposure per pose differs between the slit designs "
+                      f"({', '.join(f'{t:.4g}' for t in slit_totals)}) and the disk ({copies * e_d:.4g}).")
+        name = f"disksim_{a.scene}" + (f"_c{copies}" if copies > 1 else "") + tag + exposure_tag(a, e_d)
+        jobs.append((name, ["--aperture", "disk", "--disk_copies", str(copies), "--exposure", repr(e_d),
+                            "--noise_scaling", a.noise_scaling], copies))
 
     for name, sim_args, per_pose in jobs:
         is_slit = name.startswith("slitsim_")

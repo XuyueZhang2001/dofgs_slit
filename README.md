@@ -175,7 +175,8 @@ The script also writes `config_files/config_slitsim_real_cake.yaml` and register
 |---|---|
 | `--focus_quantile`, `--focus_depth` | focus distance, as a quantile of inverse depth or as an explicit value |
 | `--theta_bias_deg` | rendered angle = recorded angle + bias, to test learning of the angle offset |
-| `--noise_std` | additive Gaussian noise (std on [0, 1] images) on the defocused training captures; default 0 |
+| `--noise_std` | additive Gaussian noise (std on [0, 1] images, at full exposure) on the defocused training captures; default 0 |
+| `--exposure`, `--noise_scaling` | relative exposure time of every capture (default 1) and how the noise grows when it is shorter: `shot` → σ/√e (default), `read` → σ/e |
 | `--full_circle` | spread the angles over 360° instead of 180° |
 | `--defocus_only` | only (re)write `defocus/*.npy` for an existing simulated dataset |
 
@@ -232,7 +233,27 @@ python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
 # -> slitsim_real_cake_n4_a0.40_noise0.01  and  disksim_real_cake_c4_noise0.01
 ```
 
-Noisy runs have their own scene names, so they never overwrite the noise-free runs. Without noise the disk keeps one image per pose and the existing `disksim_real_cake` is reused. `collect_design_sweep.py` compares every slit run with the disk at the same noise level. The simulator warns that the noise level differs from the `--match_area` reference. You can ignore this warning, because the reference only provides the focus distance and the aperture area.
+Noisy runs have their own scene names, so they never overwrite the noise-free runs. Without noise the disk keeps one image per pose and the existing `disksim_real_cake` is reused. `collect_design_sweep.py` compares every slit run with the disk at the same noise level. The simulator prints a note that the noise level differs from the `--match_area` reference. This is expected, because the reference only provides the focus distance and the aperture area.
+
+**Equal total exposure time.** A capture with relative exposure `e < 1` records `e·I` and is brought back to full brightness by a gain `1/e`. The image therefore keeps its brightness, and only the noise grows:
+
+| `--noise_scaling` | effective std | regime |
+|---|---|---|
+| `shot` (default) | σ / √e | photon-noise limited (Gaussian approximation); n captures at 1/n equal one full capture |
+| `read` | σ / e | read-noise limited; every extra capture pays the read noise again (worst case for the slit) |
+
+`--equal_total_exposure` captures every slit design n times at exposure 1/n, and the disk once at exposure 1, so both have the same total exposure time per pose. Under either scaling, a single full exposure is the strongest disk baseline at that time budget.
+
+```shell
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --noise_std 0.01 --equal_total_exposure --noise_scaling read
+# -> slitsim_real_cake_n4_a0.40_noise0.01_e0.25_read  and  disksim_real_cake_noise0.01
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --noise_std 0.01 --equal_total_exposure --noise_scaling shot
+# -> slitsim_real_cake_n4_a0.40_noise0.01_e0.25_shot (the disk run above is reused)
+```
+
+`--slit_exposure` and `--disk_exposure` set the exposures directly. `collect_design_sweep.py` pairs each slit run with the disk that has the same noise σ and the same total exposure per pose. It also lists the captures, the exposure and the effective noise of every run.
 
 Each variant trains into its own `model_folder` (`slit_sim`, `slit_sim_perpose`, `slit_sim_scaled4`, ...). `collect_design_sweep.py` writes `./output/design_sweep/<scene>/design_sweep.{md,csv}` and `measured_vs_theory.png`.
 

@@ -49,6 +49,20 @@ that the slit model uses for reconstruction, so this is a self-consistency
 test of the optimisation (no model mismatch). Use --noise_std and
 --theta_bias_deg to make it harder.
 
+Noise and exposure (noise off by default): --noise_std s is the std of additive
+Gaussian noise on a full-exposure capture (images in [0, 1]). --exposure e is
+the relative exposure time of every training capture (default 1). A shorter
+exposure records e * I and is brought back to the full brightness by a gain
+1 / e, so the saved image is I + s_eff * N(0, 1) with
+    shot scaling (default):  s_eff = s / sqrt(e)  photon-noise limited, Gaussian
+                                                  approximation with constant std
+    read scaling:            s_eff = s / e        read-noise limited (worst case
+                                                  for many short captures)
+(--noise_scaling). Noise is added only to the defocused training captures, not
+to the all-in-focus references or test views. Example of equal total exposure
+time: slit with --n_angles 4 --exposure 0.25 vs a disk with one capture at
+exposure 1.
+
 Usage (from the repository root):
     # original design: 20 px x 2 px slit at maximal defocus
     python tools/simulate_slit_dataset.py --config ./config_files/config_real_cake.yaml \
@@ -111,7 +125,13 @@ def parse_args():
     p.add_argument("--focus_depth", type=float, default=None, help="explicit focus distance, overrides --focus_quantile")
     p.add_argument("--theta_bias_deg", type=float, default=0.0,
                    help="systematic offset between rendered and recorded angles (tests theta-offset learning)")
-    p.add_argument("--noise_std", type=float, default=0.0, help="additive Gaussian noise std on [0, 1] images")
+    p.add_argument("--noise_std", type=float, default=0.0,
+                   help="std of additive Gaussian noise on a full-exposure [0, 1] capture (default 0 = noise-free)")
+    p.add_argument("--exposure", type=float, default=1.0,
+                   help="relative exposure time of every training capture (default 1); the image is brought back "
+                        "to full brightness, so a shorter exposure only increases the noise")
+    p.add_argument("--noise_scaling", choices=["read", "shot"], default="shot",
+                   help="how the noise std grows for exposure e < 1: read -> s / e, shot -> s / sqrt(e)")
     p.add_argument("--new_scene", default=None, help="name of the simulated scene (default: slitsim_<scene>)")
     p.add_argument("--out", default=None, help="output folder (default: ./data/slit_sim/<new_scene>)")
     p.add_argument("--seed", type=int, default=0)
@@ -137,6 +157,12 @@ def parse_args():
         a.match_area = a.match_slit
     if a.match_area and a.area_px2 is not None:
         p.error("use either --match_area or --area_px2, not both")
+    if a.noise_std < 0:
+        p.error("--noise_std must be >= 0")
+    if a.exposure <= 0:
+        p.error("--exposure must be > 0")
+    if a.exposure != 1.0 and a.noise_std == 0:
+        print("[WARN] --exposure has no effect without noise (--noise_std 0).")
     return a
 
 
@@ -249,7 +275,15 @@ def main():
     base = prefix + a.scene.replace("synthetic", "syn")
     if a.aperture == "slit" and (fixed_area or a.optimal_ratio):
         base += f"_n{a.n_angles}_a{ratio:.2f}"      # design sweeps get distinct scene names
+    if a.noise_std > 0 and a.exposure != 1.0:
+        base += f"_e{a.exposure:.4g}_{a.noise_scaling}"
     new_scene = a.new_scene or base
+
+    # effective noise std of a capture, after the gain that restores full brightness
+    noise_eff = a.noise_std * (1.0 / a.exposure if a.noise_scaling == "read" else 1.0 / math.sqrt(a.exposure))
+    if a.noise_std > 0:
+        print(f"Noise: std {a.noise_std:g} at full exposure, exposure {a.exposure:g} ({a.noise_scaling} scaling) "
+              f"-> effective std {noise_eff:.4g}")
     out = a.out or os.path.join("./data/slit_sim", new_scene)
     # dataset_readers / training switch behaviour on these substrings of the data path.
     for bad in ("synthetic", "DoF"):
@@ -288,9 +322,10 @@ def main():
         with open(os.path.join(a.match_area, "sim_gt.json")) as f:
             ref_gt = json.load(f)
         F = ref_gt["focus_distance"]
-        if a.noise_std != ref_gt["noise_std"]:
-            print(f"[WARN] noise_std {a.noise_std} differs from the reference simulation ({ref_gt['noise_std']}); "
-                  f"an equal-area comparison should use the same noise level.")
+        # The reference only provides focus and area; its noise level does not matter here.
+        if a.noise_std != ref_gt.get("noise_std", 0.0):
+            print(f"[INFO] noise_std {a.noise_std} (reference simulation: {ref_gt.get('noise_std', 0.0)}); "
+                  f"compare this dataset only with others of the same noise setting.")
     else:
         F = a.focus_depth if a.focus_depth is not None else 1.0 / torch.quantile(sub, a.focus_quantile).item()
     d_max = max(abs(inv_near - 1.0 / F), abs(1.0 / F - inv_far))
@@ -347,8 +382,8 @@ def main():
         return pkg["render"]
 
     def save(img, path, noisy):
-        if noisy and a.noise_std > 0:
-            img = img + a.noise_std * torch.randn_like(img)
+        if noisy and noise_eff > 0:
+            img = img + noise_eff * torch.randn_like(img)
         torchvision.utils.save_image(img.clamp(0.0, 1.0), path)
 
     image_lines, slit_angles, test_names, used_cams = [], {}, [], set()
@@ -399,7 +434,10 @@ def main():
     gt = dict(aperture=a.aperture, source_scene=a.scene, source_iteration=a.iteration, focus_distance=F,
               K_long=K_L, K_short=K_W, width_ratio=K_W / K_L, angles_deg=angles,
               theta_bias_deg=a.theta_bias_deg if a.aperture == "slit" else 0.0,
-              max_blur_px=max_blur, noise_std=a.noise_std, aperture_coeff=gaussians.aperture_coeff,
+              max_blur_px=max_blur, noise_std=a.noise_std,
+              exposure=a.exposure, noise_scaling=a.noise_scaling, noise_std_effective=noise_eff,
+              images_per_pose=len(angles), total_exposure_per_pose=a.exposure * len(angles),
+              aperture_coeff=gaussians.aperture_coeff,
               aperture_area_K2=(K_L * K_W if a.aperture == "slit" else math.pi * K_L ** 2 / 4),
               aperture_area_px2_at_max_defocus=((K_L * K_W if a.aperture == "slit" else math.pi * K_L ** 2 / 4)
                                                 * d_max ** 2),

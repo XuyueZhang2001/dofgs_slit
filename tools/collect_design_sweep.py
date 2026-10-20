@@ -6,7 +6,10 @@ equal-area disk against the theoretical depth-of-field gain.
 It scans <root>/<model_folder>/<scene>/eval_slit_recovery/iteration_*/summary.json
 (written by tools/eval_slit_recovery.py), keeps the latest iteration of every run
 and compares each run with the disk baseline of the same source scene and noise
-level (preferring the disk trained in the same model_folder).
+setting (preferring the disk trained in the same model_folder). With noise, the
+disk must also have the same total exposure per pose (captures x exposure) and,
+when its exposure is reduced, the same noise scaling; without noise, exposure
+does not matter.
 
 Usage (from the repository root):
     python tools/collect_design_sweep.py --source_scene real_cake
@@ -82,6 +85,12 @@ def load_rows(a):
             images_per_pose=design["images_per_pose"],
             train_mode="per_pose" if design.get("group_by_pose") else "per_view",
             noise=gt.get("noise_std", 0.0),
+            # datasets simulated before exposure control used exposure 1 for every capture
+            exposure=gt.get("exposure", 1.0),
+            noise_scaling=gt.get("noise_scaling", "shot"),
+            noise_eff=gt.get("noise_std_effective", gt.get("noise_std", 0.0)),
+            total_exposure=gt.get("total_exposure_per_pose",
+                                  gt.get("exposure", 1.0) * design["images_per_pose"]),
             test_psnr=test.get("psnr"), test_ssim=test.get("ssim"),
             test_lpips=next((v for k, v in test.items() if k.startswith("lpips")), None),
             train_psnr=train.get("recovered", {}).get("psnr"),
@@ -99,10 +108,22 @@ def load_rows(a):
     return rows
 
 
+def same_capture_budget(d, r):
+    """True if disk run d is a fair reference for run r (same noise setting and total exposure)."""
+    if d["noise"] != r["noise"]:
+        return False
+    if r["noise"] == 0:
+        return True   # without noise, exposure and the number of captures do not change the images
+    if abs(d["total_exposure"] - r["total_exposure"]) > 1e-6:
+        return False
+    # the noise scaling only matters for a disk whose exposure is not 1
+    return d["exposure"] == 1.0 or d["noise_scaling"] == r["noise_scaling"]
+
+
 def add_disk_reference(rows):
     disks = [r for r in rows if r["aperture"] == "disk"]
     for r in rows:
-        cands = [d for d in disks if d["noise"] == r["noise"]]
+        cands = [d for d in disks if same_capture_budget(d, r)]
         same = [d for d in cands if d["model_folder"] == r["model_folder"]]
         ref = (same or cands or [None])[0]
         r["disk_ref"] = f"{ref['model_folder']}/{ref['scene']}" if ref else ""
@@ -121,8 +142,11 @@ def fmt(v, nd=3):
 
 
 def write_table(rows, out_dir):
+    for r in rows:
+        r["captures"] = f"{r['images_per_pose']} x {r['exposure']:.4g}"
     cols = [("run", None), ("aperture", "aperture"), ("n", "n"), ("a", "a"), ("train mode", "train_mode"),
-            ("iter", "iteration"), ("test PSNR", "test_psnr"), ("test SSIM", "test_ssim"),
+            ("iter", "iteration"), ("noise σ", "noise"), ("captures/pose x exposure", "captures"),
+            ("total exposure", "total_exposure"), ("σ_eff", "noise_eff"), ("test PSNR", "test_psnr"), ("test SSIM", "test_ssim"),
             ("test LPIPS", "test_lpips"), ("gain over input (dB)", "gain_over_input"),
             ("Δ PSNR vs disk (dB)", "delta_test_psnr_vs_disk"), ("theory DOF gain", "theory_dof_gain"),
             ("theory worst σ²/disk", "theory_worst_var")]
@@ -172,7 +196,12 @@ def plot(rows, out_dir, source_scene):
                    s=64, color=SERIES[i % 2], edgecolors="white", linewidths=2, zorder=3,
                    label=f"slit ({mode.replace('_', '-')})")
         for r in sel:
-            ax.annotate(f"n={r['n']}, a={r['a']:g}", (r["theory_dof_gain"], r["delta_test_psnr_vs_disk"]),
+            label = f"n={r['n']}, a={r['a']:g}"
+            if r["noise"]:
+                label += f", σ={r['noise']:g}"
+            if r["exposure"] != 1.0:
+                label += f", e={r['exposure']:.3g} ({r['noise_scaling']})"
+            ax.annotate(label, (r["theory_dof_gain"], r["delta_test_psnr_vs_disk"]),
                         textcoords="offset points", xytext=(7, 5), fontsize=8.5, color=INK)
     disk = [r for r in pts if r["aperture"] == "disk"]
     if disk:
