@@ -358,7 +358,7 @@ The loss is added to the in-focus AiF loss of every slit image after `infocus_st
 
 | Option (`OptimizationParams`) | Default | Meaning |
 |---|---|---|
-| `slit_dir_loss` | 0.1 | weight; 0 disables the loss (original model) |
+| `slit_dir_loss` | 0.03 | weight; 0 disables the loss (original model) |
 | `slit_dir_start_iter` | -1 | start iteration; -1 (or anything earlier) means `infocus_start_iter` |
 | `slit_dir_warmup` | 2000 | iterations of the linear weight ramp |
 | `slit_dir_sigma_w_max` | 1.0 | short-axis blur std threshold of the mask (px) |
