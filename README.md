@@ -354,11 +354,11 @@ L_dir = || M_W ⊙ ∂_v( G_u * I_AiF − G_u * I_θ ) ||_1
 - `M_W` is a soft mask from the rendered CoC map. It keeps pixels with a short-axis blur std `σ_W = a·√c·r_L` below `slit_dir_sigma_w_max`, and a long-axis blur std `σ_L = √c·r_L` at most `slit_dir_sigma_l_max`, so that `G_u` can absorb it. An image border of `3·std(G_u)` is excluded.
 - The capture and the CoC map are treated as constants, so the gradients reach only the AiF render. The loss is averaged over the masked pixels, so its weight does not depend on the mask coverage. Over the n slit angles, it constrains the AiF render along n directions.
 
-The loss is added to the in-focus AiF loss of every slit image after `infocus_start_iter`, with a linear warm-up. It is only used for `aperture_type: slit`; disk training is unchanged.
+The loss is added to the in-focus AiF loss of every slit image after `infocus_start_iter`, with a linear warm-up. It is only used for `aperture_type: slit`; disk training is unchanged. **It is off by default** (`slit_dir_loss: 0`). The experiments below found only a limited benefit.
 
 | Option (`OptimizationParams`) | Default | Meaning |
 |---|---|---|
-| `slit_dir_loss` | 0.03 | weight; 0 disables the loss (original model) |
+| `slit_dir_loss` | 0 | weight; 0 disables the loss (original model). If used, 0.005–0.03 (see the results below) |
 | `slit_dir_start_iter` | -1 | start iteration; -1 (or anything earlier) means `infocus_start_iter` |
 | `slit_dir_warmup` | 2000 | iterations of the linear weight ramp |
 | `slit_dir_sigma_w_max` | 1.0 | short-axis blur std threshold of the mask (px) |
@@ -371,12 +371,39 @@ During training, the progress bar shows `Ldir`. At every save, the training prin
 
 ```shell
 python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
-    --scene real_cake --iteration 15000 --gpu 1 --no_disk --dir_loss 0.03 0.1 0.3
+    --scene real_cake --iteration 15000 --gpu 1 --no_disk --dir_loss 0 0.005 0.03
 ```
 
-Each weight `w > 0` is trained into `./output/model_dofgs/slit_sim_dir<w>/<scene>/`. `--dir_loss 0` reuses or reproduces the original model in `slit_sim`. Without `--dir_loss`, the sweep uses the code default (0.1). `collect_design_sweep.py` reads the weight from each run's `config_runtime.yaml` and shows it in the `λ_dir` column. A `_dir` run is compared with the disk of the same folder without the suffix. Runs trained before this option existed count as `λ_dir = 0`.
+Each weight `w > 0` is trained into `./output/model_dofgs/slit_sim_dir<w>/<scene>/`. `--dir_loss 0` reuses or reproduces the original model in `slit_sim`. Without `--dir_loss`, the sweep uses the code default (0, i.e. off). `collect_design_sweep.py` reads the weight from each run's `config_runtime.yaml` and shows it in the `λ_dir` column. A `_dir` run is compared with the disk of the same folder without the suffix. Runs trained before this option existed count as `λ_dir = 0`. `python tools/list_runs.py --filter <text>` lists the image, depth and point-cloud metrics of all matching runs in one table.
 
-When you run `train.py` by hand on this branch, slit configs use `slit_dir_loss: 0.1` unless the config sets it. Give such runs their own `model_folder`, so that they do not mix with results of the original model.
+To use the loss with `train.py` directly, set `slit_dir_loss` in the config and give the run its own `model_folder`, so that it does not mix with results of the original model.
+
+### Results and recommendation
+
+The tests used the `real_cake` scene, simulated with n = 4 and a = 0.4 (10 × 4 px slit at the largest defocus), 40 000 iterations and one image per iteration. All numbers are from the test split.
+
+Without noise:
+
+| λ_dir | 0 (run 1) | 0 (run 2) | 0.001 | 0.005 | 0.01 | 0.03 | 0.05 | 0.1 | 0.3 |
+|---|---|---|---|---|---|---|---|---|---|
+| AiF PSNR | 31.98 | 32.17 | 32.23 | 32.26 | 31.95 | 32.32 | 31.95 | 31.93 | 31.89 |
+| AiF LPIPS ↓ | 0.039 | 0.039 | 0.039 | 0.038 | 0.040 | 0.039 | 0.042 | 0.042 | 0.041 |
+
+With noise σ = 0.01 (4 captures per pose):
+
+| λ_dir | AiF PSNR | LPIPS ↓ | depth abs_rel ↓ | depth rmse ↓ | point-cloud chamfer ↓ | F@0.005 ↑ | Gaussians |
+|---|---|---|---|---|---|---|---|
+| 0 | 31.88 | 0.0399 | **0.0627** | **11.93** | **3.607** | 0.686 | 106 990 |
+| 0.03 | **31.99** | **0.0395** | 0.0639 | 14.05 | 3.653 | 0.685 | 112 919 |
+
+Findings:
+
+- **Run-to-run variation is about 0.2 dB.** Two identical λ_dir = 0 runs differ by 0.19 dB (CUDA non-determinism, even with a fixed seed). For λ_dir between 0.001 and 0.03, the AiF PSNR lies within this range and does not change monotonically with the weight. Any gain is therefore not significant.
+- **Weights of 0.05 and above are slightly worse.** Three runs agree: AiF PSNR is about 31.9 and LPIPS rises to 0.041–0.042.
+- **Geometry does not improve.** With noise, depth rmse gets worse (11.93 → 14.05), and the point-cloud metrics stay about the same. The loss constrains only the appearance of the AiF render, and the number of Gaussians grows by 2–6 %. Some of the added Gaussians do not lie on the surface.
+- **Why the effect is small.** In this simulation the forward model matches the data exactly and the angles are known, so the defocus loss already uses the directional information of the slit captures. `L_dir` adds little new information. It may matter more with model mismatch (real optics, box PSF), larger blur, or wrong `K` / depth estimates. This has not been tested.
+
+**Recommendation.** Keep the loss off (default). If you use it, choose `slit_dir_loss` between **0.005 and 0.03**. In that range it may give a small AiF gain without hurting the images. Check depth and point-cloud metrics as well, and confirm any gain with repeated runs.
 
 CPU checks (axis convention, invariance to the long-axis blur, mask, gradients): `python tests/test_directional_loss.py`.
 
@@ -403,6 +430,7 @@ tools/
   aperture_theory.py         equal-area slit vs disk theory (optimal ratio, DOF gain, SNR gain)
   run_design_sweep.py        simulate -> train -> evaluate for several (n, a) designs
   collect_design_sweep.py    results table and measured-vs-theory plot
+  list_runs.py               image, depth and point-cloud metrics of all evaluated runs
 tests/
   test_slit_rasterizer.py    rasterizer smoke test (regression, anisotropy, gradients)
   test_directional_loss.py   CPU checks of the directional all-in-focus loss
