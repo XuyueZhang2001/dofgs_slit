@@ -45,6 +45,23 @@ Directional AiF loss (slit only; src/utils/directional_loss.py)
                       suffix _dir<w> to the model_folder (e.g. slit_sim_dir0.1), and
                       0 reproduces the original model in the unsuffixed folder.
 
+Known optics (simulated datasets)
+  --optics none|init|fixed
+                      none (default): F and K are initialised from the scene depth and
+                      learned; init: the ground truth of sim_gt.json is the initial
+                      value, still learned; fixed: ground truth, frozen (theta offset 0).
+                      Applies to slit and disk; adds _optinit / _optfixed to the
+                      model_folder (e.g. slit_sim_optfixed).
+
+PSF model (see tools/simulate_slit_dataset.py and tools/psf_render.py)
+  --psf gaussian|box|gaussian_layered
+                      PSF of the simulated captures; slit and disk use the same model.
+                      Non-default models add _box / _glayer to the scene names.
+  --diffraction       (layered PSFs) add in-focus diffraction (simulator default optics);
+                      adds _diff to the scene names.
+  Training always uses the Gaussian model of the rasterizer, so box / diffraction
+  datasets test the reconstruction under model mismatch.
+
 Usage (from the repository root, e.g. inside tmux):
     python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
         --scene real_cake --iteration 15000 --gpu 1                    # default design 4:0.4 + disk
@@ -78,6 +95,8 @@ SCHEDULE_SCALARS = [
     "densify_compatnes_interval", "compatnes_until_iter", "iter_stop_cam_gd", "maskNet_start_iter",
 ]
 SCHEDULE_LISTS = ["test_iterations", "save_iterations", "add_point_iterations"]
+# scene-name suffix of each PSF model (must match tools/simulate_slit_dataset.py)
+PSF_SUFFIX = {"gaussian": "", "box": "_box", "gaussian_layered": "_glayer"}
 TRAIN_PY_LIST_DEFAULTS = {"test_iterations": [1_000, 3_000, 7_000, 30_000],
                           "save_iterations": [1_000, 3_000, 7_000, 30_000],
                           "add_point_iterations": [2500]}
@@ -103,6 +122,14 @@ def parse_args():
                    help="relative exposure time of every slit capture (default 1)")
     p.add_argument("--disk_exposure", type=float, default=1.0,
                    help="relative exposure time of every disk capture (default 1)")
+    p.add_argument("--optics", choices=["none", "init", "fixed"], default="none",
+                   help="ground-truth optics (sim_gt.json) for training: none (learned from a depth-based guess), "
+                        "init (ground truth as initial value, learned) or fixed (frozen); adds _opt<mode>")
+    p.add_argument("--psf", choices=["gaussian", "box", "gaussian_layered"], default="gaussian",
+                   help="PSF model of the simulated captures (see tools/simulate_slit_dataset.py); "
+                        "slit and disk always use the same model")
+    p.add_argument("--diffraction", action="store_true",
+                   help="(layered PSFs) add in-focus diffraction with the simulator's default optics")
     p.add_argument("--noise_scaling", choices=["read", "shot"], default="shot",
                    help="noise growth for exposure e < 1: read -> s / e, shot -> s / sqrt(e)")
     p.add_argument("--equal_total_exposure", action="store_true",
@@ -207,6 +234,10 @@ def build_variant_config(base_cfg_path, a, images_per_pose, is_slit, dir_loss=No
         conf.slit_dir_loss = float(dir_loss)
         if dir_loss > 0:
             parts.append(f"dir{dir_loss:g}")
+    if a.optics != "none":
+        # ground-truth optics of the simulated dataset (slit and disk alike)
+        conf.optics_from_sim_gt = a.optics
+        parts.append(f"opt{a.optics}")
 
     base_iters = int(conf.get("iterations", defaults["iterations"]))
     scale = 1.0
@@ -262,6 +293,13 @@ def main():
     if any(w < 0 for w in dir_values):
         raise SystemExit("--dir_loss weights must be >= 0")
     print(f"Directional AiF loss weight(s) for slit runs: {', '.join(f'{w:g}' for w in dir_values)}")
+    if a.diffraction and a.psf == "gaussian":
+        raise SystemExit("--diffraction needs a layered PSF: use --psf box or --psf gaussian_layered")
+    # PSF model: same scene-name suffix as tools/simulate_slit_dataset.py (psf_suffix)
+    ptag = PSF_SUFFIX[a.psf] + ("_diff" if a.diffraction else "")
+    psf_args = ["--psf", a.psf] + (["--diffraction"] if a.diffraction else [])
+    if a.psf != "gaussian":
+        print(f"PSF model of the simulated captures: {a.psf}" + (" + diffraction" if a.diffraction else ""))
 
     # (scene name, simulate arguments, images per pose)
     jobs, slit_ns, slit_totals = [], [], []
@@ -271,9 +309,9 @@ def main():
         e = slit_exposure_for(a, n)
         slit_ns.append(n)
         slit_totals.append(n * e)
-        name = f"slitsim_{a.scene}_n{n}_a{r:.2f}{tag}{exposure_tag(a, e)}"
+        name = f"slitsim_{a.scene}_n{n}_a{r:.2f}{tag}{exposure_tag(a, e)}{ptag}"
         jobs.append((name, ["--n_angles", str(n), "--width_ratio", str(r), "--exposure", repr(e),
-                            "--noise_scaling", a.noise_scaling], n))
+                            "--noise_scaling", a.noise_scaling] + psf_args, n))
         if a.noise_std > 0:
             print(f"slit n={n}, a={r:g}: {n} captures x exposure {e:.4g} (total {n * e:.4g} per pose)")
     if not a.no_disk:
@@ -285,9 +323,9 @@ def main():
             if any(abs(t - copies * e_d) > 1e-6 for t in slit_totals):
                 print(f"[WARN] the total exposure per pose differs between the slit designs "
                       f"({', '.join(f'{t:.4g}' for t in slit_totals)}) and the disk ({copies * e_d:.4g}).")
-        name = f"disksim_{a.scene}" + (f"_c{copies}" if copies > 1 else "") + tag + exposure_tag(a, e_d)
+        name = f"disksim_{a.scene}" + (f"_c{copies}" if copies > 1 else "") + tag + exposure_tag(a, e_d) + ptag
         jobs.append((name, ["--aperture", "disk", "--disk_copies", str(copies), "--exposure", repr(e_d),
-                            "--noise_scaling", a.noise_scaling], copies))
+                            "--noise_scaling", a.noise_scaling] + psf_args, copies))
 
     for name, sim_args, per_pose in jobs:
         is_slit = name.startswith("slitsim_")

@@ -35,7 +35,7 @@ r_W    = 0.5 * K_W * d                    half-length along the slit short axis 
 | `src/utils/directional_loss.py` | Directional all-in-focus loss: smoothing along the long slit axis, derivative across the short axis, short-axis blur mask. |
 | `src/scene/dataset_readers.py` | Optional `split.json` for an explicit train/test split. |
 | `render.py` | `--slit_sweep` re-renders training views at arbitrary slit angles. |
-| `tools/` | Simulation of slit and equal-area circular-aperture datasets, AIF recovery evaluation, and comparison of recovered optics with ground truth. |
+| `tools/` | Simulation of slit and equal-area circular-aperture datasets (Gaussian PSF, or layered box / disk PSF with optional diffraction), AIF recovery evaluation, and comparison of recovered optics with ground truth. |
 | `tests/` | GPU smoke test for the rasterizer; CPU checks of the directional loss. |
 
 ---
@@ -179,6 +179,7 @@ The script also writes `config_files/config_slitsim_real_cake.yaml` and register
 | `--noise_std` | additive Gaussian noise (std on [0, 1] images, at full exposure) on the defocused training captures; default 0 |
 | `--exposure`, `--noise_scaling` | relative exposure time of every capture (default 1) and how the noise grows when it is shorter: `shot` → σ/√e (default), `read` → σ/e |
 | `--full_circle` | spread the angles over 360° instead of 180° |
+| `--psf` | PSF model of the captures: `gaussian` (default, **recommended**: the rasterizer's model), `gaussian_layered` or `box` (experimental, see [Realistic PSF simulation](#realistic-psf-simulation-layered)) |
 | `--defocus_only` | only (re)write `defocus/*.npy` for an existing simulated dataset |
 
 `K` is parametrised as `K = clamp(Ks, 0.01, 200) * 100 + 100`, so `K_L < 101` cannot be represented. The script warns when the requested blur is too small.
@@ -411,9 +412,118 @@ CPU checks (axis convention, invariance to the long-axis blur, mask, gradients):
 
 ---
 
+## Training with known optics (simulated datasets)
+
+By default, the focus distance `F` and the aperture `K` are initialised from the scene depth and learned together with the scene. Under model mismatch (for example, layered `--psf gaussian_layered` data reconstructed with the rasterizer's splat blur), the learned optics can drift to compensate for the blur model. In one test they drifted by 7.6 % (F) and 6.2 % (K), placing the focal plane wrongly. This option tests whether correct optics recover a sharp all-in-focus image.
+
+`optics_from_sim_gt` (in `ModelParams`) uses the ground truth stored in `<source_path>/sim_gt.json`. For a slit, this is `F`, `K_L` and the width ratio; for a disk, `F` and `K_D`:
+
+| Value | Behaviour |
+|---|---|
+| `none` (default) | depth-based initial values, learned (original behaviour) |
+| `init` | ground truth as initial values, still learned |
+| `fixed` | ground truth, frozen; the slit angle offset is fixed at 0 |
+
+`init` shows whether the drift comes from the initialisation or from the optimisation itself. `fixed` shows the result with correct optics. A real system can reach this regime by calibrating the focus distance and the aperture. The training log prints the values used.
+
+```shell
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --psf gaussian_layered --optics fixed
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --psf gaussian_layered --optics init
+```
+
+**Result.** On layered (`gaussian_layered`) data, `init` and `fixed` did not improve the all-in-focus image. For the disk, `fixed` was 3.6 dB worse than `none`. The drift of the learned optics is a consequence of the blur-model mismatch, not its cause (see [Results and recommendation](#results-and-recommendation-1) under the layered simulation). The default `none` is recommended.
+
+`--optics init|fixed` applies to slit and disk alike. It reuses the existing datasets and trains into `slit_sim_optinit` / `slit_sim_optfixed`. To use the option with `train.py` directly, set `optics_from_sim_gt` in the config and give the run its own `model_folder`. `tools/list_runs.py` shows the mode in the `optics` column; runs trained before this option existed count as `none`. Use `tools/compare_slit_params.py` to check how far `init` runs drift from the ground truth.
+
+---
+
+## Realistic PSF simulation (layered)
+
+> **Recommended: keep the default `--psf gaussian`.** The layered PSFs are experimental. With them, the reconstruction does not recover a sharper all-in-focus image than its inputs (see [Results and recommendation](#results-and-recommendation-1) below).
+
+By default, the simulator renders the defocused captures with the rasterizer's Gaussian PSF, which is the same model the reconstruction uses. `--psf box` instead renders them with the real aperture shape, while the reconstruction still uses the Gaussian. This tests the method under model mismatch. The renderer is in `tools/psf_render.py`:
+
+1. The scene is split into `--n_layers` (default 48) layers, uniform in inverse depth, by Gaussian centre. The layer range is the 0.1–99.9 % range of the visible centres of each view.
+2. Each layer is rendered on its own, without defocus, as premultiplied colour and alpha. The alpha comes from two renders, on black and on white backgrounds. Because the full 3D model is available, content hidden behind foreground layers is also rendered.
+3. Each layer is convolved, by FFT with replicate padding, with the PSF of its defocus `d = |1/z − 1/F|`:
+   - slit: a uniform box of `K_L·d × K_W·d` along θ;
+   - disk: a uniform disk of diameter `K_D·d`;
+   - `gaussian_layered`: the rasterizer's Gaussian, used to check the pipeline.
+
+   Kernels are supersampled (`--supersample`, default 8) and normalised.
+4. The layers are composited back to front, `I ← k*(αC) + (1 − k*α)·I`, which approximates foreground blur spreading over the background. Tone mapping is applied afterwards.
+
+Sizes follow the existing definitions (full length `K·d`), so equal-area comparisons and `--match_area` are unchanged. The box has the same variance as the Gaussian it replaces (`L²/12 = r²/3`), so the two simulations differ only in the PSF shape. All-in-focus references and test views stay ideal.
+
+**Diffraction (optional, `--diffraction`).** The in-focus Fraunhofer PSF of the physical aperture is convolved with every layer kernel, per colour channel: `sinc²` along both slit axes, or an Airy pattern for the disk. The physical aperture has the shape of the simulated one and the area `--aperture_area_mm2`. The default optics are **assumed values, not a measured system**:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--aperture_area_mm2` | 40 | aperture area: 10 × 4 mm slit at a = 0.4, 20 × 2 mm at a = 0.1, 7.1 mm disk |
+| `--focal_mm` | 50 | focal length |
+| `--pixel_um` | 4.0 | effective pixel pitch of the simulated images (sensor pitch × downsampling) |
+| `--wavelengths_nm` | 610 550 465 | R, G, B wavelengths |
+
+With these defaults, the first zero across a 4 mm slit lies at `λf/w` ≈ 1.5–1.9 px (B to R), and the Airy first zero of the disk at about 1.0–1.3 px. Across a 2 mm slit (a = 0.1), the diffraction blur is twice as large. The simulator prints these values and stores them in `sim_gt.json`. Note that the effective pixel pitch scales the result directly: images downsampled by 4× have a 4× larger pitch and 4× less diffraction in pixels.
+
+```shell
+# check the layered pipeline against the default simulation (should be close)
+python tools/simulate_slit_dataset.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --n_angles 4 --width_ratio 0.4 \
+    --match_area ./data/slit_sim/slitsim_real_cake --psf gaussian_layered
+# box PSF, slit and equal-area disk, then train and evaluate with the Gaussian model
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --psf box
+# box PSF with diffraction
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --psf box --diffraction
+```
+
+Non-default PSFs add `_glayer`, `_box` and `_diff` to the scene names, for example `slitsim_real_cake_n4_a0.40_box` and `disksim_real_cake_box`. `collect_design_sweep.py` and `list_runs.py` show the PSF model, and each slit run is compared only with the disk of the same PSF model. In the evaluation, the row *re-rendered blur vs input (fit)* shows how well the Gaussian model fits the captures.
+
+CPU checks of the kernels and the compositing: `python tests/test_psf_render.py`.
+
+**Cost and limitations.** Each training pose needs `2 × n_layers` renders plus one FFT convolution per layer and angle. This adds minutes to the simulation, but nothing to training. Gaussians are assigned to layers by their centres, so large Gaussians that span several layers are blurred with a single kernel. Layered compositing is an approximation of occlusion-aware defocus, not ray tracing. Diffraction is added as an in-focus PSF, an approximation of the full defocused Fresnel PSF that holds when either geometric blur or diffraction dominates. Aberrations and vignetting are not modelled.
+
+### Results and recommendation
+
+The tests used `real_cake`, with n = 4 and a = 0.4 (10 × 4 px at the largest defocus) and the equal-area disk (7.14 px). There was no noise, 40 000 iterations and one image per iteration. All numbers are from the test split.
+
+**The two simulations blur differently.** The inputs share the same optics and the same PSF variance. The all-in-focus references of both datasets are identical, because they come from the same renderer. The layered inputs, however, are much closer to the all-in-focus ground truth. Between the two simulations, the slit inputs differ by 31.96 dB on average, and the mean brightness stays the same (blurred / AiF = 1.0065 vs 0.998).
+
+| Input vs AiF GT (PSNR) | `--psf gaussian` | `--psf gaussian_layered` |
+|---|---|---|
+| slit | 29.04 | 32.85 |
+| disk | 30.24 | 34.18 |
+
+**Reconstruction of the layered data with the rasterizer model.** The table shows the test AiF PSNR for each `--optics` mode:
+
+| | input | `none` | `init` | `fixed` | fit (re-rendered vs input, train) |
+|---|---|---|---|---|---|
+| slit, layered | 32.85 | 29.23 | 29.43 | 29.40 | 39.07 (45.20 for `--psf gaussian`) |
+| disk, layered | 34.18 | 33.62 | 32.23 | 30.02 | 42.17 (44.04 for `--psf gaussian`) |
+
+With the default `--psf gaussian`, the slit reaches 31.98 dB (+2.8 dB over its inputs). With layered data, the recovered all-in-focus image is **worse than the blurred inputs**. It is blurred overall, with no blotches. In the `none` mode, the learned optics also drift (F −7.6 %, K +6.2 %). However, correct optics (`init`, `fixed`) do not help the slit and make the disk worse. The learned optics compensate for the error; they do not cause it.
+
+**Cause: the rasterizer's defocus is not a convolution.** The rasterizer adds the CoC covariance to each 2D splat, but keeps the splat's peak opacity. Its opacity coefficient only compensates the Mip-Splatting 2D filter. This is the same as in the original DOF-GS code. A physical blur of a splat lowers the peak by `sqrt(det Σ / det(Σ + ΔΣ))`, which can be a factor of tens for small splats. Without it, the blurred splats stay nearly opaque. Each pixel then mostly takes the colour of the front-most enlarged splats, instead of averaging its neighbourhood. When the data are blurred physically, the true scene is not a solution of the fitting problem. The optimiser dims and spreads the fine details, which bakes the blur into the scene, so the all-in-focus render comes out blurred. Different views and slit angles require different compensations. The slit suffers more than the disk, also because the slit shares F and K across all views (`slit_share_F/K: true`), while the disk, like the original DOF-GS, learns them per view.
+
+**Why DOF-GS still works on real photos.** On the real Deblur-NeRF defocus scenes, its reported AiF PSNR (24.12 dB) is comparable to other deblurring methods and 1.4–2.9 dB above methods that do not model blur. It is not a near-perfect deblurring. Per-view learnable focus and aperture can absorb part of the model error, and the in-focus localisation supervises the all-in-focus render directly where the captures are sharp.
+
+**Recommendation.**
+
+- **Use the default `--psf gaussian`** for aperture-design studies (n, a, noise, exposure). Results then compare slit and disk *within the DOF-GS blur model*. They test the optimisation and the aperture design, but not physical accuracy. State this when reporting them.
+- Keep `gaussian_layered` / `box` for model-mismatch studies.
+- For real slit data, consider per-view optics (`slit_share_F: false`, `slit_share_K: false`), which gives the slit the same compensation as the original DOF-GS.
+- A physically consistent fix would scale each splat's opacity by `sqrt(det Σ / det(Σ + ΔΣ))` (energy-conserving CoC). This is not implemented.
+
+---
+
 ## Notes and limitations
 
-- **Gaussian PSF approximation.** The rectangular PSF is approximated by an anisotropic Gaussian with matched variance. Sharp edges, sinc zeros of the OTF, diffraction from a narrow slit, and partial occlusion at depth boundaries are not modelled. The simulator uses the same approximation, so simulation results test the optimisation (identifiability, convergence), not model mismatch.
+- **Gaussian PSF approximation.** The reconstruction approximates the rectangular PSF by an anisotropic Gaussian with matched variance. Sharp edges, sinc zeros of the OTF, diffraction from a narrow slit, and partial occlusion at depth boundaries are not modelled. The default and recommended simulation (`--psf gaussian`) uses the same approximation, so it tests the optimisation (identifiability, convergence) and the aperture design, not model mismatch. Use `--psf gaussian_layered` / `box` (optionally with `--diffraction`) to test model mismatch; see [Realistic PSF simulation](#realistic-psf-simulation-layered).
+- **Splat blur is not a convolution.** Like the original DOF-GS, the rasterizer enlarges each splat by the CoC but keeps its peak opacity, so its defocus does not conserve energy. On physically blurred (layered) data, the recovered all-in-focus image is worse than the inputs. See [Results and recommendation](#results-and-recommendation-1) under the layered simulation.
 - **Width identifiability.** The slit covariance splits into `s_W·I + (s_L − s_W)·uuᵀ`. The rotating rank-1 term constrains `F`, `K_L` and θ well. The isotropic term `s_W·I` is the same in every orientation and can be absorbed by slightly larger Gaussians, so a learned width ratio may collapse towards 0, especially when the short-axis blur is only a few pixels. When the slit geometry is known, fix the ratio with `slit_ratio_lr: 0`.
 - **Simulated vs. paper metrics.** Simulated datasets use DOF-GS renders as ground truth. Absolute PSNR/SSIM values are therefore not comparable to the numbers in the DOF-GS paper; compare configurations on the same simulated data instead.
 - The random seed is fixed in `src/model_dofgs/training.py` (`3467`). Use several seeds before drawing conclusions from small metric differences.
@@ -431,9 +541,11 @@ tools/
   run_design_sweep.py        simulate -> train -> evaluate for several (n, a) designs
   collect_design_sweep.py    results table and measured-vs-theory plot
   list_runs.py               image, depth and point-cloud metrics of all evaluated runs
+  psf_render.py              layered rendering with box / disk / Gaussian PSFs and diffraction
 tests/
   test_slit_rasterizer.py    rasterizer smoke test (regression, anisotropy, gradients)
   test_directional_loss.py   CPU checks of the directional all-in-focus loss
+  test_psf_render.py         CPU checks of the PSF kernels and layered compositing
 src/utils/slit_utils.py      slit angle loading, grouping of images by camera pose
 src/utils/directional_loss.py  directional all-in-focus loss for slit captures
 ```

@@ -18,7 +18,7 @@ import os
 
 COLUMNS = [  # (header, key)
     ("model_folder", "model_folder"), ("scene", "scene"), ("iter", "iteration"), ("λ_dir", "dir_loss"),
-    ("noise", "noise"), ("PSNR", "psnr"), ("SSIM", "ssim"), ("LPIPS", "lpips"),
+    ("PSF", "psf"), ("optics", "optics"), ("noise", "noise"), ("PSNR", "psnr"), ("SSIM", "ssim"), ("LPIPS", "lpips"),
     ("abs_rel", "abs_rel"), ("rmse", "rmse"), ("delta1", "delta1"),
     ("acc", "accuracy"), ("comp", "completeness"), ("chamfer", "chamfer"),
     ("acc_med", "accuracy_median"), ("comp_med", "completeness_median"),
@@ -26,15 +26,15 @@ COLUMNS = [  # (header, key)
 ]
 
 
-def runtime_dir_loss(model_path):
-    """slit_dir_loss from config_runtime.yaml (0 for runs trained before it existed)."""
+def runtime_config(model_path):
+    """config_runtime.yaml of a run as a dict (empty if missing or unreadable)."""
     path = os.path.join(model_path, "config_runtime.yaml")
     try:
         import yaml
         with open(path) as f:
-            return float((yaml.safe_load(f) or {}).get("slit_dir_loss", 0.0))
+            return yaml.safe_load(f) or {}
     except Exception:
-        return None
+        return {}
 
 
 def load(root, flt):
@@ -52,8 +52,12 @@ def load(root, flt):
         test = summ.get("test", {})
         rec, depth, geo = test.get("recovered", {}), test.get("depth", {}), summ.get("geometry", {})
         aperture = gt.get("aperture", "slit")
+        cfg = runtime_config(model_path)
         row = dict(model_folder=key[0], scene=key[1], iteration=s["iteration"],
-                   dir_loss=runtime_dir_loss(model_path) if aperture == "slit" else None,
+                   # runs trained before these options existed: weight 0, optics learned
+                   dir_loss=float(cfg.get("slit_dir_loss", 0.0)) if aperture == "slit" else None,
+                   optics=str(cfg.get("optics_from_sim_gt", "none")),
+                   psf=gt.get("psf", "gaussian") + ("+diff" if (gt.get("diffraction") or {}).get("enabled") else ""),
                    noise=gt.get("noise_std"), psnr=rec.get("psnr"), ssim=rec.get("ssim"),
                    lpips=next((v for k, v in rec.items() if k.startswith("lpips")), None),
                    abs_rel=depth.get("abs_rel"), rmse=depth.get("rmse"), delta1=depth.get("delta1"))

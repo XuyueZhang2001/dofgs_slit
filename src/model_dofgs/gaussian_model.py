@@ -257,8 +257,11 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         
     def setup_defocus_params(self, N_view, camera_translate, dataset_path, mask_act='binary', COC_MAX=15,
-                             slit_cfg=None):
+                             slit_cfg=None, optics=None):
         """
+        optics: None, or a dict {'F': focus distance, 'K': aperture scale (K_L / K_D),
+            'ratio': slit width ratio} used as the initial values instead of the
+            depth-based guess (e.g. the ground truth of a simulated dataset).
         slit_cfg: None for the original circular aperture, otherwise a dict with
             'thetas'             : (N_view, 1) known slit angles in radians, in view-index order
             'width_ratio'        : initial short-axis / long-axis aperture ratio, in (0, 1)
@@ -300,7 +303,16 @@ class GaussianModel:
         self.Fs = self.Fs.to(self.device)
         self.Ks = torch.ones(n_K, 1) * 10.0 * K_shrink_factor
         self.Ks = self.Ks.to(self.device)
-        
+        if optics is not None:
+            # invert the parametrisation of get_defocus_params():
+            #   F = clamp(Fs, 0.01, 1000) * 10,  K = clamp(Ks, 0.01, 200) * 100 + 100
+            if optics['K'] < 101.0:
+                print(f"[WARN] K = {optics['K']:.1f} is below the smallest representable K (101)")
+            self.Fs = torch.full((n_F, 1), float(optics['F']) / 10.0, device=self.device)
+            self.Ks = torch.full((n_K, 1), (float(optics['K']) - 100.0) / 100.0, device=self.device)
+            print(f"Defocus parameters from given optics: F = {optics['F']:.4f}, K = {optics['K']:.2f}"
+                  + (f", width ratio = {optics['ratio']:.4f}" if slit_cfg is not None else ""))
+
         self.Fs = nn.Parameter(self.Fs.requires_grad_(True))
         self.Ks = nn.Parameter(self.Ks.requires_grad_(True))
 
@@ -309,6 +321,8 @@ class GaussianModel:
             assert thetas.shape[0] == N_view, 'slit angles must be given for every training view'
             self.thetas_known = thetas.to(self.device)
             ratio = float(slit_cfg.get('width_ratio', 0.1))
+            if optics is not None and optics.get('ratio') is not None:
+                ratio = float(optics['ratio'])
             ratio = min(max(ratio, 1e-4), 1.0 - 1e-4)
             self.slit_ratio_raw = nn.Parameter(
                 torch.full((1, 1), math.log(ratio / (1.0 - ratio)), device=self.device).requires_grad_(True))

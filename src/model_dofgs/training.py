@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 from random import randint
 import random
@@ -135,9 +136,29 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
         print('Slit angles (deg): ' + ', '.join(
             f'{n}:{math.degrees(t):.1f}' for n, t in zip(view_names, slit_thetas.squeeze(1).tolist())))
 
-    gaussians.setup_defocus_params(len(viewpoint_stack), scene.cameras_translate, 
+    # Optional ground-truth optics of a simulated dataset (optics_from_sim_gt: none / init / fixed).
+    optics_mode = str(getattr(dataset, 'optics_from_sim_gt', 'none')).lower()
+    if optics_mode not in ('none', 'init', 'fixed'):
+        raise ValueError(f"optics_from_sim_gt must be 'none', 'init' or 'fixed', got '{optics_mode}'")
+    optics = None
+    if optics_mode != 'none':
+        gt_path = os.path.join(dataset.source_path, 'sim_gt.json')
+        if not os.path.isfile(gt_path):
+            raise FileNotFoundError(f"optics_from_sim_gt='{optics_mode}' needs {gt_path} (simulated datasets only)")
+        with open(gt_path) as f:
+            sim_gt = json.load(f)
+        optics = dict(F=float(sim_gt['focus_distance']), K=float(sim_gt['K_long']),
+                      ratio=float(sim_gt['K_short']) / float(sim_gt['K_long']))
+        print(f"Optics from {gt_path} ({optics_mode}): F = {optics['F']:.4f}, K = {optics['K']:.2f}, "
+              f"ratio = {optics['ratio']:.4f}")
+
+    gaussians.setup_defocus_params(len(viewpoint_stack), scene.cameras_translate,
                                     dataset.source_path, mask_act='sigmoid', COC_MAX=dataset.coc_max,
-                                    slit_cfg=slit_cfg)
+                                    slit_cfg=slit_cfg, optics=optics)
+    if optics_mode == 'fixed':
+        # F, K, width ratio and theta offset receive no gradients; the optimizer skips them
+        gaussians.freeze_defocus_params()
+        print('Defocus parameters frozen at the given optics (theta offset fixed at 0)')
     scene.gaussians = gaussians
 
     # Optional pose-grouped iterations: all images sharing one camera pose

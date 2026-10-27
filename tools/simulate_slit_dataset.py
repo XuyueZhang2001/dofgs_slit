@@ -63,6 +63,23 @@ to the all-in-focus references or test views. Example of equal total exposure
 time: slit with --n_angles 4 --exposure 0.25 vs a disk with one capture at
 exposure 1.
 
+PSF model of the defocused captures (--psf):
+    gaussian (default)  rasterizer's Gaussian approximation; the same model is used
+                        for reconstruction (no model mismatch)
+    box                 layered rendering (tools/psf_render.py) with the real
+                        aperture shape: a uniform box slit or a uniform disk
+    gaussian_layered    layered rendering with the rasterizer's Gaussian; checks the
+                        layered pipeline against 'gaussian'
+--diffraction (layered PSFs only) adds the in-focus Fraunhofer PSF of the
+physical aperture (sinc^2 for the slit, Airy for the disk, per colour channel).
+The physical aperture is defined by its area (--aperture_area_mm2), the focal
+length (--focal_mm), the effective pixel pitch of the simulated images
+(--pixel_um, sensor pitch times any downsampling) and the wavelengths. The
+defaults (50 mm lens, 40 mm^2 aperture, i.e. a 10 x 4 mm slit at a = 0.4 or a
+7.1 mm disk, 4 um pixels, 610 / 550 / 465 nm) are assumed values, not a
+measured system. All-in-focus references and test views stay ideal.
+Non-default PSFs add the suffix _box / _glayer (and _diff) to the scene name.
+
 Usage (from the repository root):
     # original design: 20 px x 2 px slit at maximal defocus
     python tools/simulate_slit_dataset.py --config ./config_files/config_real_cake.yaml \
@@ -96,6 +113,7 @@ from src.model_dofgs.gaussian_model import GaussianModel, SLIT_APERTURE_COEFF
 # Variance coefficient of a uniform disk of radius r (per axis): r^2 / 4.
 DISK_UNIFORM_COEFF = 0.25
 from src.model_dofgs.renderer import render, ToneMapping
+import psf_render
 from aperture_theory import (evenly_spaced_angles, max_offset_deg, optimal_ratio,
                              summarize as theory_summary)
 
@@ -152,6 +170,21 @@ def parse_args():
     p.add_argument("--defocus_only", action="store_true",
                    help="only (re)write <out>/defocus/*.npy for an existing simulated dataset, "
                         "using the optics stored in its sim_gt.json")
+    # ---- PSF model of the defocused captures ----
+    p.add_argument("--psf", choices=["gaussian", "box", "gaussian_layered"], default="gaussian",
+                   help="gaussian: rasterizer's Gaussian (default); box: layered rendering with a box slit / "
+                        "uniform disk; gaussian_layered: layered rendering with the Gaussian (pipeline check)")
+    p.add_argument("--n_layers", type=int, default=48, help="inverse-depth layers of the layered rendering")
+    p.add_argument("--supersample", type=int, default=8, help="kernel supersampling per pixel and axis")
+    p.add_argument("--diffraction", action="store_true",
+                   help="(layered PSFs) add the in-focus Fraunhofer diffraction PSF of the physical aperture")
+    p.add_argument("--wavelengths_nm", type=float, nargs=3, default=[610.0, 550.0, 465.0],
+                   help="wavelength of the R, G, B channels for diffraction (nm)")
+    p.add_argument("--focal_mm", type=float, default=50.0, help="focal length for diffraction (mm)")
+    p.add_argument("--pixel_um", type=float, default=4.0,
+                   help="effective pixel pitch of the simulated images (um): sensor pitch x downsampling")
+    p.add_argument("--aperture_area_mm2", type=float, default=40.0,
+                   help="physical aperture area (mm^2); 40 = 10 x 4 mm slit (a = 0.4) or 7.1 mm disk")
     a = p.parse_args()
     if a.match_slit and not a.match_area:
         a.match_area = a.match_slit
@@ -163,7 +196,59 @@ def parse_args():
         p.error("--exposure must be > 0")
     if a.exposure != 1.0 and a.noise_std == 0:
         print("[WARN] --exposure has no effect without noise (--noise_std 0).")
+    if a.diffraction and a.psf == "gaussian":
+        p.error("--diffraction needs a layered PSF: use --psf box or --psf gaussian_layered")
+    if a.n_layers < 1 or a.supersample < 1:
+        p.error("--n_layers and --supersample must be >= 1")
     return a
+
+
+PSF_SUFFIX = {"gaussian": "", "box": "_box", "gaussian_layered": "_glayer"}
+
+
+def psf_suffix(psf, diffraction):
+    """Scene-name suffix of a PSF model (shared with tools/run_design_sweep.py)."""
+    return PSF_SUFFIX[psf] + ("_diff" if diffraction else "")
+
+
+def physical_aperture(a, aperture, K_L, K_W):
+    """
+    Physical aperture size (mm) with the area --aperture_area_mm2 and the shape of
+    the simulated aperture, plus the in-focus diffraction scale per channel (px).
+    """
+    area_K = K_L * K_W if aperture == "slit" else math.pi * K_L ** 2 / 4.0
+    mm_per_K = math.sqrt(a.aperture_area_mm2 / area_K)
+    out = dict(area_mm2=a.aperture_area_mm2, focal_mm=a.focal_mm, pixel_um=a.pixel_um,
+               wavelengths_nm=list(a.wavelengths_nm))
+    if aperture == "slit":
+        out.update(long_mm=mm_per_K * K_L, short_mm=mm_per_K * K_W)
+        # first zero of sinc^2 across / along the slit: lambda f / width
+        out["first_zero_short_px"] = [w * 1e-3 * a.focal_mm / out["short_mm"] / a.pixel_um
+                                      for w in a.wavelengths_nm]
+        out["first_zero_long_px"] = [w * 1e-3 * a.focal_mm / out["long_mm"] / a.pixel_um
+                                     for w in a.wavelengths_nm]
+    else:
+        out.update(diameter_mm=mm_per_K * K_L)
+        # first zero (radius) of the Airy pattern: 1.22 lambda f / D
+        out["airy_first_zero_px"] = [1.22 * w * 1e-3 * a.focal_mm / out["diameter_mm"] / a.pixel_um
+                                     for w in a.wavelengths_nm]
+    return out
+
+
+def optical_kernel_fn(a, aperture, phys):
+    """theta -> (3, h, w) in-focus diffraction kernels (one per colour channel)."""
+    def fn(theta):
+        ks = []
+        for w in a.wavelengths_nm:
+            if aperture == "slit":
+                ks.append(psf_render.slit_diffraction_kernel(phys["long_mm"], phys["short_mm"], theta, w,
+                                                             a.focal_mm, a.pixel_um))
+            else:
+                ks.append(psf_render.disk_diffraction_kernel(phys["diameter_mm"], w, a.focal_mm, a.pixel_um))
+        size = max(k.shape[-1] for k in ks)
+        padded = [torch.nn.functional.pad(k, [(size - k.shape[-1]) // 2] * 4) for k in ks]
+        return torch.stack(padded)
+    return fn
 
 
 def build_dataset_args(conf, scene_dict, scene):
@@ -277,6 +362,7 @@ def main():
         base += f"_n{a.n_angles}_a{ratio:.2f}"      # design sweeps get distinct scene names
     if a.noise_std > 0 and a.exposure != 1.0:
         base += f"_e{a.exposure:.4g}_{a.noise_scaling}"
+    base += psf_suffix(a.psf, a.diffraction)
     new_scene = a.new_scene or base
 
     # effective noise std of a capture, after the gain that restores full brightness
@@ -381,6 +467,32 @@ def main():
                      K_w=p11(Kw), slit_theta=p11(theta))
         return pkg["render"]
 
+    # ---- layered PSF rendering (non-default --psf) ----
+    layered = a.psf != "gaussian"
+    phys = physical_aperture(a, a.aperture, K_L, K_W) if (layered and a.diffraction) else None
+    if layered:
+        optical = optical_kernel_fn(a, a.aperture, phys) if a.diffraction else None
+        kernel_fn = psf_render.make_kernel_fn(a.psf, a.aperture, K_L, K_W, gaussians.aperture_coeff,
+                                              ss=a.supersample, optical=optical)
+        print(f"Layered rendering: psf {a.psf}, {a.n_layers} inverse-depth layers, supersampling {a.supersample}")
+        if phys is not None:
+            if a.aperture == "slit":
+                print(f"Diffraction: slit {phys['long_mm']:.2f} x {phys['short_mm']:.2f} mm, f = {a.focal_mm:g} mm, "
+                      f"pixel {a.pixel_um:g} um; first zero across the slit "
+                      + ", ".join(f"{z:.2f}" for z in phys["first_zero_short_px"]) + " px (R, G, B)")
+            else:
+                print(f"Diffraction: disk {phys['diameter_mm']:.2f} mm, f = {a.focal_mm:g} mm, "
+                      f"pixel {a.pixel_um:g} um; Airy first zero "
+                      + ", ".join(f"{z:.2f}" for z in phys["airy_first_zero_px"]) + " px (R, G, B)")
+        if tonemap_type != "none":
+            print(f"[WARN] tone map '{tonemap_type}' is applied after the layered blur (blur in linear space).")
+
+    def render_aif_linear(cam, bg_color):
+        """Render without defocus and without tone mapping (input of the layered rendering)."""
+        return render(cam, gaussians, pipe, bg_color, p11(1.0), p11(0.0), select_view=0, tone_map=None,
+                      band_limit=band_limit, kernel_size=kernel_size,
+                      K_w=p11(0.0), slit_theta=p11(0.0))["render"]
+
     def save(img, path, noisy):
         if noisy and noise_eff > 0:
             img = img + noise_eff * torch.randn_like(img)
@@ -396,13 +508,23 @@ def main():
                            f"{e.camera_id} {name}.png\n\n")
 
     with torch.no_grad():
+        layer_blur_px = []
         for cam in train_cams:
             stem = cam.image_name
             save(render_img(cam, 0.0, 0.0, 0.0), os.path.join(aif_dir, f"{stem}.png"), noisy=False)
+            if layered:
+                # one layered rendering per pose for all distinct angles (disk copies share one image)
+                uniq = sorted(set(angles))
+                thetas = [math.radians(x + a.theta_bias_deg) for x in uniq]
+                imgs, info = psf_render.render_layered(cam, gaussians, render_aif_linear, F, thetas, kernel_fn,
+                                                       a.n_layers, bg, tone_map=tone_map)
+                by_angle = dict(zip(uniq, imgs))
+                layer_blur_px.append(info["layer_step"] * K_L)
             for k, ang in enumerate(angles):
                 name = f"{stem}_a{k:02d}"
                 theta = math.radians(ang + a.theta_bias_deg)
-                save(render_img(cam, K_L, K_W, theta), os.path.join(img_dir, f"{name}.png"), noisy=True)
+                img = by_angle[ang] if layered else render_img(cam, K_L, K_W, theta)
+                save(img, os.path.join(img_dir, f"{name}.png"), noisy=True)
                 add_image(name, stem)
                 slit_angles[name] = ang  # nominal angle, without the simulated bias
         for cam in test_cams:
@@ -410,6 +532,10 @@ def main():
             save(render_img(cam, 0.0, 0.0, 0.0), os.path.join(img_dir, f"{stem}.png"), noisy=False)
             add_image(stem, stem)
             test_names.append(stem)
+
+    if layer_blur_px:
+        print(f"Layered rendering: blur-length change across one layer {min(layer_blur_px):.2f}-"
+              f"{max(layer_blur_px):.2f} px (long axis); increase --n_layers if this is well above 0.5 px")
 
     write_defocus_maps(out, train_cams + test_cams, gaussians, pipe, F, K_L, band_limit, kernel_size)
 
@@ -437,6 +563,10 @@ def main():
               max_blur_px=max_blur, noise_std=a.noise_std,
               exposure=a.exposure, noise_scaling=a.noise_scaling, noise_std_effective=noise_eff,
               images_per_pose=len(angles), total_exposure_per_pose=a.exposure * len(angles),
+              psf=a.psf, n_layers=(a.n_layers if layered else None),
+              supersample=(a.supersample if layered else None),
+              layer_blur_px=([min(layer_blur_px), max(layer_blur_px)] if layer_blur_px else None),
+              diffraction=dict(enabled=bool(a.diffraction), **(phys or {})),
               aperture_coeff=gaussians.aperture_coeff,
               aperture_area_K2=(K_L * K_W if a.aperture == "slit" else math.pi * K_L ** 2 / 4),
               aperture_area_px2_at_max_defocus=((K_L * K_W if a.aperture == "slit" else math.pi * K_L ** 2 / 4)

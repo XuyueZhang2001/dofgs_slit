@@ -6,7 +6,8 @@ equal-area disk against the theoretical depth-of-field gain.
 It scans <root>/<model_folder>/<scene>/eval_slit_recovery/iteration_*/summary.json
 (written by tools/eval_slit_recovery.py), keeps the latest iteration of every run
 and compares each run with the disk baseline of the same source scene and noise
-setting (preferring the disk trained in the same model_folder). With noise, the
+setting and the same PSF model of the simulation (preferring the disk trained
+in the same model_folder). With noise, the
 disk must also have the same total exposure per pose (captures x exposure) and,
 when its exposure is reduced, the same noise scaling; without noise, exposure
 does not matter.
@@ -88,6 +89,7 @@ def load_rows(a):
             images_per_pose=design["images_per_pose"],
             train_mode="per_pose" if design.get("group_by_pose") else "per_view",
             dir_loss=dir_loss,
+            psf=psf_label(gt),
             noise=gt.get("noise_std", 0.0),
             # datasets simulated before exposure control used exposure 1 for every capture
             exposure=gt.get("exposure", 1.0),
@@ -112,8 +114,18 @@ def load_rows(a):
     return rows
 
 
+def psf_label(gt):
+    """PSF model of a simulated dataset: gaussian (default), box, gaussian_layered, '+diff' with diffraction."""
+    label = gt.get("psf", "gaussian")
+    if (gt.get("diffraction") or {}).get("enabled"):
+        label += "+diff"
+    return label
+
+
 def same_capture_budget(d, r):
-    """True if disk run d is a fair reference for run r (same noise setting and total exposure)."""
+    """True if disk run d is a fair reference for run r (same PSF model, noise setting and total exposure)."""
+    if d["psf"] != r["psf"]:
+        return False
     if d["noise"] != r["noise"]:
         return False
     if r["noise"] == 0:
@@ -156,7 +168,7 @@ def write_table(rows, out_dir):
     for r in rows:
         r["captures"] = f"{r['images_per_pose']} x {r['exposure']:.4g}"
     cols = [("run", None), ("aperture", "aperture"), ("n", "n"), ("a", "a"), ("train mode", "train_mode"),
-            ("λ_dir", "dir_loss"), ("iter", "iteration"), ("noise σ", "noise"), ("captures/pose x exposure", "captures"),
+            ("λ_dir", "dir_loss"), ("PSF", "psf"), ("iter", "iteration"), ("noise σ", "noise"), ("captures/pose x exposure", "captures"),
             ("total exposure", "total_exposure"), ("σ_eff", "noise_eff"), ("test PSNR", "test_psnr"), ("test SSIM", "test_ssim"),
             ("test LPIPS", "test_lpips"), ("gain over input (dB)", "gain_over_input"),
             ("Δ PSNR vs disk (dB)", "delta_test_psnr_vs_disk"), ("theory DOF gain", "theory_dof_gain"),
@@ -214,6 +226,8 @@ def plot(rows, out_dir, source_scene):
                 label += f", e={r['exposure']:.3g} ({r['noise_scaling']})"
             if r["dir_loss"]:
                 label += f", λ_dir={r['dir_loss']:g}"
+            if r["psf"] != "gaussian":
+                label += f", {r['psf']}"
             ax.annotate(label, (r["theory_dof_gain"], r["delta_test_psnr_vs_disk"]),
                         textcoords="offset points", xytext=(7, 5), fontsize=8.5, color=INK)
     disk = [r for r in pts if r["aperture"] == "disk"]

@@ -74,6 +74,12 @@ class ModelParams(ParamGroup):
         self.slit_share_K = True
         # Learn a global offset between the nominal slit angles and the image axes.
         self.slit_learn_theta_offset = True
+        # Optics of simulated datasets (<source_path>/sim_gt.json: focus distance F,
+        # aperture K (K_L for a slit, K_D for a disk) and slit width ratio):
+        #   'none'  : default; F and K are initialised from the scene depth and learned
+        #   'init'  : ground-truth values as initialisation, still learned
+        #   'fixed' : ground-truth values, frozen (theta offset fixed at 0)
+        self.optics_from_sim_gt = 'none'
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -119,7 +125,7 @@ class OptimizationParams(ParamGroup):
         # Directional all-in-focus loss for slit captures (src/utils/directional_loss.py):
         # compare the AiF render and the capture across the short slit axis after
         # smoothing both along the long axis. Only used for aperture_type 'slit'.
-        self.slit_dir_loss = 0.0            # weight; 0 disables it
+        self.slit_dir_loss = 0.0            # weight; 0 disables it (default). If used: 0.005-0.03, see README
         self.slit_dir_start_iter = -1       # -1: same as infocus_start_iter (never earlier)
         self.slit_dir_warmup = 2000         # linear ramp of the weight after the start
         self.slit_dir_sigma_w_max = 1.0     # short-axis blur std threshold (px) of the mask
