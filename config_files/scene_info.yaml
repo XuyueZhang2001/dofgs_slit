@@ -102,3 +102,19 @@ slitsim_real_cake_n4_a0.40_noise0.05:
 disksim_real_cake_c4_noise0.05:
   source_path: ./data/slit_sim/disksim_real_cake_c4_noise0.05
   holdout: 8
+
+slitsim_real_cake_n4_a0.40_glayer:
+  source_path: ./data/slit_sim/slitsim_real_cake_n4_a0.40_glayer
+  holdout: 8
+
+disksim_real_cake_glayer:
+  source_path: ./data/slit_sim/disksim_real_cake_glayer
+  holdout: 8
+
+slitsim_real_cake_n4_a0.40_check:
+  source_path: ./data/slit_sim/slitsim_real_cake_n4_a0.40_check
+  holdout: 8
+
+disksim_real_cake_check:
+  source_path: ./data/slit_sim/disksim_real_cake_check
+  holdout: 8

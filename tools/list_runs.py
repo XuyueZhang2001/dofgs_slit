@@ -18,7 +18,7 @@ import os
 
 COLUMNS = [  # (header, key)
     ("model_folder", "model_folder"), ("scene", "scene"), ("iter", "iteration"), ("λ_dir", "dir_loss"),
-    ("PSF", "psf"), ("optics", "optics"), ("noise", "noise"), ("PSNR", "psnr"), ("SSIM", "ssim"), ("LPIPS", "lpips"),
+    ("PSF", "psf"), ("optics", "optics"), ("densify", "densify"), ("thr", "threshold"), ("noise", "noise"), ("PSNR", "psnr"), ("SSIM", "ssim"), ("LPIPS", "lpips"),
     ("abs_rel", "abs_rel"), ("rmse", "rmse"), ("delta1", "delta1"),
     ("acc", "accuracy"), ("comp", "completeness"), ("chamfer", "chamfer"),
     ("acc_med", "accuracy_median"), ("comp_med", "completeness_median"),
@@ -57,6 +57,9 @@ def load(root, flt):
                    # runs trained before these options existed: weight 0, optics learned
                    dir_loss=float(cfg.get("slit_dir_loss", 0.0)) if aperture == "slit" else None,
                    optics=str(cfg.get("optics_from_sim_gt", "none")),
+                   densify=(str(cfg.get("slit_densify_stat", "mean")) if aperture == "slit" else "mean"),
+                   threshold=(f"{float(cfg['densify_grad_threshold']):g}"
+                              if cfg.get("densify_grad_threshold") is not None else None),
                    psf=gt.get("psf", "gaussian") + ("+diff" if (gt.get("diffraction") or {}).get("enabled") else ""),
                    noise=gt.get("noise_std"), psnr=rec.get("psnr"), ssim=rec.get("ssim"),
                    lpips=next((v for k, v in rec.items() if k.startswith("lpips")), None),

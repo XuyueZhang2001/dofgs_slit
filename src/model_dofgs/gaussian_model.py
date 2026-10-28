@@ -59,6 +59,10 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        # Densification statistics are accumulated in this many groups (columns),
+        # e.g. one per slit angle; densify_and_prune takes the maximum group mean.
+        # 1 = the original 3DGS statistic (mean over all views).
+        self.densify_groups = 1
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -429,10 +433,14 @@ class GaussianModel:
         elif training_args.F_optimizer_type == 'rprop':
             self.optimizer_F = torch.optim.Rprop(l, lr=0.0)
         
+    def set_densify_groups(self, n_groups):
+        """Number of groups of the densification statistics (call before training_setup)."""
+        self.densify_groups = max(int(n_groups), 1)
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], self.densify_groups), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], self.densify_groups), device="cuda")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -684,8 +692,8 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], self.densify_groups), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], self.densify_groups), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
 
@@ -873,9 +881,20 @@ class GaussianModel:
             prune_mask = ((self.get_opacity - weight * min_opacity) < 0.0).squeeze()
         return prune_mask
                 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densification_grads(self):
+        """
+        (N, 1) densification statistic: mean view-space gradient norm per group
+        (groups never seen count as 0), maximum over the groups. With one group
+        this is the original mean over all views.
+        """
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
+        if grads.shape[1] > 1:
+            grads = grads.max(dim=1, keepdim=True).values
+        return grads
+
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+        grads = self.densification_grads()
 
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
@@ -894,6 +913,8 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
-        self.denom[update_filter] += 1
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, group=0):
+        """Accumulate the view-space gradient norm of the visible Gaussians in column `group`."""
+        g = min(int(group), self.xyz_gradient_accum.shape[1] - 1)
+        self.xyz_gradient_accum[update_filter, g] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1)
+        self.denom[update_filter, g] += 1

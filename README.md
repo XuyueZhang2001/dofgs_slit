@@ -355,11 +355,11 @@ L_dir = || M_W ⊙ ∂_v( G_u * I_AiF − G_u * I_θ ) ||_1
 - `M_W` is a soft mask from the rendered CoC map. It keeps pixels with a short-axis blur std `σ_W = a·√c·r_L` below `slit_dir_sigma_w_max`, and a long-axis blur std `σ_L = √c·r_L` at most `slit_dir_sigma_l_max`, so that `G_u` can absorb it. An image border of `3·std(G_u)` is excluded.
 - The capture and the CoC map are treated as constants, so the gradients reach only the AiF render. The loss is averaged over the masked pixels, so its weight does not depend on the mask coverage. Over the n slit angles, it constrains the AiF render along n directions.
 
-The loss is added to the in-focus AiF loss of every slit image after `infocus_start_iter`, with a linear warm-up. It is only used for `aperture_type: slit`; disk training is unchanged. **It is off by default** (`slit_dir_loss: 0`). The experiments below found only a limited benefit.
+The loss is added to the in-focus AiF loss of every slit image after `infocus_start_iter`, with a linear warm-up. It is only used for `aperture_type: slit`; disk training is unchanged. **The default weight is 0.03**, used together with the direction-aware densification (`slit_densify_stat: max_angle`). Alone, the loss gave only a limited benefit; combined with `max_angle`, it gave the best all-in-focus image (see [Combined results](#combined-results-directional-loss--direction-aware-densification)).
 
 | Option (`OptimizationParams`) | Default | Meaning |
 |---|---|---|
-| `slit_dir_loss` | 0 | weight; 0 disables the loss (original model). If used, 0.005–0.03 (see the results below) |
+| `slit_dir_loss` | 0.03 | weight; 0 disables the loss (original model) |
 | `slit_dir_start_iter` | -1 | start iteration; -1 (or anything earlier) means `infocus_start_iter` |
 | `slit_dir_warmup` | 2000 | iterations of the linear weight ramp |
 | `slit_dir_sigma_w_max` | 1.0 | short-axis blur std threshold of the mask (px) |
@@ -375,9 +375,9 @@ python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
     --scene real_cake --iteration 15000 --gpu 1 --no_disk --dir_loss 0 0.005 0.03
 ```
 
-Each weight `w > 0` is trained into `./output/model_dofgs/slit_sim_dir<w>/<scene>/`. `--dir_loss 0` reuses or reproduces the original model in `slit_sim`. Without `--dir_loss`, the sweep uses the code default (0, i.e. off). `collect_design_sweep.py` reads the weight from each run's `config_runtime.yaml` and shows it in the `λ_dir` column. A `_dir` run is compared with the disk of the same folder without the suffix. Runs trained before this option existed count as `λ_dir = 0`. `python tools/list_runs.py --filter <text>` lists the image, depth and point-cloud metrics of all matching runs in one table.
+Each weight `w > 0` is trained into `./output/model_dofgs/slit_sim_dir<w>/<scene>/`. `--dir_loss 0` reuses or reproduces the original model in `slit_sim`. Without `--dir_loss`, the sweep uses the code default (0.03). `collect_design_sweep.py` reads the weight from each run's `config_runtime.yaml` and shows it in the `λ_dir` column. A `_dir` run is compared with the disk of the same folder without the suffix. Runs trained before this option existed count as `λ_dir = 0`. `python tools/list_runs.py --filter <text>` lists the image, depth and point-cloud metrics of all matching runs in one table.
 
-To use the loss with `train.py` directly, set `slit_dir_loss` in the config and give the run its own `model_folder`, so that it does not mix with results of the original model.
+With `train.py` directly, slit configs without `slit_dir_loss` use the default 0.03. Set `slit_dir_loss: 0` (and `slit_densify_stat: mean`) for the original model, and give each variant its own `model_folder`, so that results do not mix.
 
 ### Results and recommendation
 
@@ -404,11 +404,65 @@ Findings:
 - **Geometry does not improve.** With noise, depth rmse gets worse (11.93 → 14.05), and the point-cloud metrics stay about the same. The loss constrains only the appearance of the AiF render, and the number of Gaussians grows by 2–6 %. Some of the added Gaussians do not lie on the surface.
 - **Why the effect is small.** In this simulation the forward model matches the data exactly and the angles are known, so the defocus loss already uses the directional information of the slit captures. `L_dir` adds little new information. It may matter more with model mismatch (real optics, box PSF), larger blur, or wrong `K` / depth estimates. This has not been tested.
 
-**Recommendation.** Keep the loss off (default). If you use it, choose `slit_dir_loss` between **0.005 and 0.03**. In that range it may give a small AiF gain without hurting the images. Check depth and point-cloud metrics as well, and confirm any gain with repeated runs.
+**Recommendation (loss alone).** On its own, the loss gives at most a small gain, so a weight between 0.005 and 0.03 is safe. Together with the direction-aware densification, 0.03 gave the best result and is now the default; see [Combined results](#combined-results-directional-loss--direction-aware-densification).
 
 CPU checks (axis convention, invariance to the long-axis blur, mask, gradients): `python tests/test_directional_loss.py`.
 
 **Limitations.** `G_u * h_u ≈ G_u` is an approximation: the effective widths are `√(σ_u² + σ_L²)` and `σ_u`. Near occlusion boundaries the blur is not shift-invariant. The mask depends on the current depth and `K` estimates.
+
+---
+
+## Direction-aware densification (slit)
+
+3DGS splits or clones a Gaussian when its mean view-space gradient norm, averaged over all views where it is visible, exceeds `densify_grad_threshold` (default 0.0002). With a rotating slit, detail is visible mainly in the views whose short axis `v` crosses it. Views whose long axis blurs the detail away give almost no gradient. Averaged over the n angles, such detail is diluted to roughly 1/n–1/2 of its strength, so it may never reach the threshold. A disk blurs every view the same way, so it does not have this problem.
+
+`slit_densify_stat: max_angle` (in `OptimizationParams`, **default for slits**) accumulates the statistic per slit angle and densifies on the strongest angle:
+
+```
+ḡ_i = max_θ ( Σ_{views at θ} ‖∇μ_i‖ / #views at θ )
+```
+
+A Gaussian is refined if *any* slit orientation shows that it is under-resolved. Angles θ and θ + 180° form one group. A disk has a single group, so the option does not change it. `mean` is the original statistic. Only Python code changes (the statistics become one column per angle); the rasterizer is unchanged.
+
+The statistic usually produces more Gaussians, and more Gaussians alone can raise PSNR. Compare it with a **threshold-matched control**, which uses the original mean with a lower threshold so that it ends with about as many Gaussians (`#pts` in `list_runs.py`):
+
+```shell
+# defaults: max over angles + directional loss 0.03 (existing noise-free dataset, slit only)
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --no_disk
+# control: same loss, original mean statistic, lower threshold (tune until #pts matches the run above)
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --no_disk --densify_stat mean --densify_grad_threshold 0.00015
+# original model: no directional loss, mean statistic (folder slit_sim)
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --no_disk --dir_loss 0 --densify_stat mean
+python tools/list_runs.py --filter slitsim_real_cake_n4_a0.40 | grep -E "slit_sim |densmax|thr|model_folder|---"
+```
+
+| Option | Default | Model folder suffix |
+|---|---|---|
+| `--densify_stat mean\|max_angle` (`slit_densify_stat`) | `max_angle` | `_densmax` (slit runs only) |
+| `--densify_grad_threshold t` | config / 0.0002 | `_thr<t>` |
+
+The training log prints the statistic and the threshold in use. `list_runs.py` shows them in the `densify` and `thr` columns, and `collect_design_sweep.py` compares `_densmax` / `_thr` slit runs with the disk of the folder without these suffixes.
+
+### Combined results (directional loss + direction-aware densification)
+
+The tests used `real_cake` simulated with n = 4 and a = 0.4, noise-free, the Gaussian PSF (`--psf gaussian`), 40 000 iterations and the default threshold 0.0002. All numbers are from the test split. Three identical runs of the original model give the run-to-run spread.
+
+| λ_dir | densify | AiF PSNR | SSIM | LPIPS ↓ | depth abs_rel ↓ | chamfer ↓ | F@0.005 ↑ | Gaussians |
+|---|---|---|---|---|---|---|---|---|
+| 0 | mean (3 runs) | 31.98 / 32.17 / 32.05 | 0.929–0.930 | 0.038–0.039 | 0.055–0.059 | 3.35–6.63 | 0.68–0.70 | 117–123 k |
+| 0.03 | mean | 32.32 | 0.932 | 0.039 | 0.056 | 3.74 | 0.689 | 120 k |
+| 0 | max_angle | 32.22 | 0.931 | 0.039 | 0.060 | 3.67 | 0.704 | 152 k |
+| 0.003 | max_angle | 32.38 | 0.932 | 0.038 | 0.063 | 4.09 | 0.696 | 148 k |
+| **0.03** | **max_angle** | **32.56** | **0.935** | **0.037** | 0.060 | 4.58 | 0.690 | 148 k |
+
+- **Images.** λ_dir = 0.03 with `max_angle` gives the best AiF image: +0.5 dB over the mean of the three baseline runs, above their 0.19 dB spread, with the best SSIM and LPIPS. Each option alone gives about +0.15–0.25 dB, within or near the spread.
+- **Geometry.** Rendered depth stays about the same. The point-cloud metrics vary strongly between identical baseline runs (chamfer 3.35–6.63), and the combined run lies within that range. Its accuracy (rec→GT) and chamfer distance are worse than in two of the three baseline runs. `max_angle` adds about 25 % more Gaussians. The F-scores stay about the same.
+- **Not yet controlled.** The gain has not been compared with a threshold-matched control (`--densify_stat mean` with a lower threshold and as many Gaussians), and comes from single runs. Repeat runs and the control are needed before claiming it.
+
+**Defaults.** For slit apertures, `slit_dir_loss: 0.03` and `slit_densify_stat: max_angle` are the defaults. Use `slit_dir_loss: 0` and `slit_densify_stat: mean` (sweep: `--dir_loss 0 --densify_stat mean`) for the original model. Disk training is not affected by either option.
 
 ---
 

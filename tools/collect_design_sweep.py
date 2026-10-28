@@ -137,8 +137,11 @@ def same_capture_budget(d, r):
 
 
 def base_model_folder(folder):
-    """model_folder without the directional-loss suffix (slit_sim_dir0.1 -> slit_sim)."""
-    return re.sub(r"_dir[0-9.eE+-]+", "", folder)
+    """
+    model_folder without the suffixes of slit-only training options
+    (slit_sim_dir0.1 -> slit_sim, slit_sim_densmax_thr0.00015 -> slit_sim).
+    """
+    return re.sub(r"_(dir|thr)[0-9.eE+-]+|_densmax", "", folder)
 
 
 def add_disk_reference(rows):

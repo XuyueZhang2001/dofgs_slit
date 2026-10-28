@@ -181,7 +181,27 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
               f'(warm-up {dir_warmup}), sigma_W < {opt.slit_dir_sigma_w_max:g} px, '
               f'sigma_L <= {opt.slit_dir_sigma_l_max:g} px, '
               f'smoothing std {opt.slit_dir_smooth_mult * opt.slit_dir_sigma_l_max:g} px along the long axis')
-    
+
+    # Densification statistic. 'mean' (default): mean view-space gradient norm over
+    # all views (3DGS). 'max_angle' (slit only): mean per slit angle, maximum over the
+    # angles, so detail that is visible only across one slit orientation is not
+    # diluted by the angles that blur it away.
+    densify_stat = str(getattr(opt, 'slit_densify_stat', 'mean')).lower()
+    if densify_stat not in ('mean', 'max_angle'):
+        raise ValueError(f"slit_densify_stat must be 'mean' or 'max_angle', got '{densify_stat}'")
+    view_group = {}   # image name -> densification group (slit angle index)
+    if densify_stat == 'max_angle' and slit_cfg is not None:
+        # theta and theta + 180 deg give the same PSF
+        deg = [round(math.degrees(t), 2) % 180.0 for t in slit_thetas.squeeze(1).tolist()]
+        angles = sorted(set(deg))
+        view_group = {name: angles.index(d) for name, d in zip(view_names, deg)}
+        gaussians.set_densify_groups(len(angles))
+        print(f'Densification statistic: max over {len(angles)} slit angles '
+              f'({", ".join(f"{x:g}" for x in angles)} deg)')
+    elif densify_stat == 'max_angle':
+        print('[INFO] slit_densify_stat max_angle applies to slit apertures only; using the mean')
+    print(f'Densification gradient threshold: {opt.densify_grad_threshold:g}')
+
     # Set up training stuffs, such as optimizers
     gaussians.training_setup(opt)
     gaussians.join_optim_mlp_params(opt)
@@ -326,7 +346,8 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
             if iteration < opt.densify_until_iter:
                 with torch.no_grad():
                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter,
+                                                      view_group.get(viewpoint_cam.image_name, 0))
 
         # mean loss over the images of this iteration (a single image unless pose-grouped)
         loss = torch.tensor(loss_sum, device=device)

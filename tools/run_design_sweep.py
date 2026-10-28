@@ -40,10 +40,22 @@ Exposure (only matters with noise; see tools/simulate_slit_dataset.py)
 Directional AiF loss (slit only; src/utils/directional_loss.py)
   --dir_loss w [w ...]
                       weight(s) of the directional all-in-focus loss. Default: the
-                      default of OptimizationParams.slit_dir_loss. Every value is trained
-                      and evaluated on the same simulated dataset; a weight > 0 adds the
-                      suffix _dir<w> to the model_folder (e.g. slit_sim_dir0.1), and
-                      0 reproduces the original model in the unsuffixed folder.
+                      default of OptimizationParams.slit_dir_loss (0.03). Every value is
+                      trained and evaluated on the same simulated dataset; a weight > 0
+                      adds the suffix _dir<w> to the model_folder (e.g. slit_sim_dir0.03).
+
+Densification
+  --densify_stat mean|max_angle
+                      statistic that decides which Gaussians are split / cloned. mean:
+                      mean view-space gradient norm over all views (original 3DGS).
+                      max_angle (slit runs only): mean per slit angle, maximum over the
+                      angles; adds _densmax to the model_folder. Default: the default of
+                      OptimizationParams.slit_densify_stat (max_angle). A disk is not
+                      affected. The original model is --dir_loss 0 --densify_stat mean
+                      (unsuffixed folder slit_sim).
+  --densify_grad_threshold t
+                      threshold of that statistic (default 0.0002); adds _thr<t>. Use it
+                      for a control that matches the number of Gaussians of another run.
 
 Known optics (simulated datasets)
   --optics none|init|fixed
@@ -122,6 +134,12 @@ def parse_args():
                    help="relative exposure time of every slit capture (default 1)")
     p.add_argument("--disk_exposure", type=float, default=1.0,
                    help="relative exposure time of every disk capture (default 1)")
+    p.add_argument("--densify_stat", choices=["mean", "max_angle"], default=None,
+                   help="densification statistic of slit runs: mean over all views, or the maximum over slit "
+                        "angles of the per-angle mean (adds _densmax); default: OptimizationParams default")
+    p.add_argument("--densify_grad_threshold", type=float, default=None,
+                   help="densification gradient threshold (default: config / code default 0.0002); "
+                        "adds _thr<value>")
     p.add_argument("--optics", choices=["none", "init", "fixed"], default="none",
                    help="ground-truth optics (sim_gt.json) for training: none (learned from a depth-based guess), "
                         "init (ground truth as initial value, learned) or fixed (frozen); adds _opt<mode>")
@@ -152,6 +170,8 @@ def parse_args():
         p.error("--noise_std must be >= 0")
     if a.disk_copies is not None and a.disk_copies < 1:
         p.error("--disk_copies must be >= 1")
+    if a.densify_grad_threshold is not None and a.densify_grad_threshold <= 0:
+        p.error("--densify_grad_threshold must be > 0")
     if a.equal_total_exposure and a.slit_exposure is not None:
         p.error("--equal_total_exposure sets the slit exposure to 1/n; do not pass --slit_exposure as well")
     for k in ("slit_exposure", "disk_exposure"):
@@ -238,6 +258,15 @@ def build_variant_config(base_cfg_path, a, images_per_pose, is_slit, dir_loss=No
         # ground-truth optics of the simulated dataset (slit and disk alike)
         conf.optics_from_sim_gt = a.optics
         parts.append(f"opt{a.optics}")
+    if is_slit:
+        # explicit statistic in the config, so the run does not depend on the code default
+        # (a disk has a single group: unchanged either way)
+        conf.slit_densify_stat = a.densify_stat
+        if a.densify_stat == "max_angle":
+            parts.append("densmax")
+    if a.densify_grad_threshold is not None:
+        conf.densify_grad_threshold = float(a.densify_grad_threshold)
+        parts.append(f"thr{a.densify_grad_threshold:g}")
 
     base_iters = int(conf.get("iterations", defaults["iterations"]))
     scale = 1.0
@@ -290,6 +319,9 @@ def main():
     ref_area = area_of(ref)
     env = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": str(a.gpu)}
     dir_values = a.dir_loss if a.dir_loss is not None else [float(optimization_defaults().get("slit_dir_loss", 0.0))]
+    if a.densify_stat is None:
+        a.densify_stat = str(optimization_defaults().get("slit_densify_stat", "mean"))
+    print(f"Densification statistic for slit runs: {a.densify_stat}")
     if any(w < 0 for w in dir_values):
         raise SystemExit("--dir_loss weights must be >= 0")
     print(f"Directional AiF loss weight(s) for slit runs: {', '.join(f'{w:g}' for w in dir_values)}")
