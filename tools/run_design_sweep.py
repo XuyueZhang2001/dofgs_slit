@@ -407,7 +407,8 @@ def main():
             elif os.path.isfile(summary):
                 print(f"[skip] evaluation {summary} exists")
 
-    if not a.dry_run:
+    # the collection needs evaluation summaries; skip it for e.g. --steps simulate
+    if not a.dry_run and "eval" in a.steps:
         run([py, "tools/collect_design_sweep.py", "--source_scene", a.scene],
             os.path.join("logs", "design_sweep", f"collect_{a.scene}.log"), {}, False)
 

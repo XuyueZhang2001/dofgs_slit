@@ -340,6 +340,35 @@ This prints the estimated and ground-truth `F`, `K_L`, `K_W`, width ratio and an
 
 ---
 
+## Multi-scene comparison (slit vs disk)
+
+`tools/run_all_scenes.sh` repeats the real_cake comparison on the 10 real DOF-GS scenes: `real_cake`, `real_caps`, `real_cisco`, `real_coral`, `real_cupcake`, `real_cups`, `real_daisy`, `real_sausage`, `real_seal` and `real_tools`. Each scene needs its data and the authors' pre-trained model in `output/model_dofgs/real_results/<scene>/`. The settings match real_cake. The aperture area is 40 px² at the largest defocus of each scene, from a reference dataset `slitsim_<scene>` with the original 20 × 2 px slit, and the focus is at the median inverse depth. The captures are noise-free, with the Gaussian PSF. Three models are trained per scene:
+
+| Method | Model |
+|---|---|
+| slit (densmax+L_dir) | n = 4, a = 0.4, `max_angle` densification + directional AiF loss 0.03 (defaults) → `slit_sim_dir0.03_densmax/slitsim_<scene>_n4_a0.40` |
+| slit (orig) | same data, no directional loss, `mean` densification → `slit_sim/slitsim_<scene>_n4_a0.40` |
+| disk | equal-area disk, one capture per pose → `slit_sim/disksim_<scene>` |
+
+```shell
+bash tools/run_all_scenes.sh --gpu 1 --stage simulate     # datasets; checks that K is representable
+bash tools/run_all_scenes.sh --gpu 1 --stage train        # train + evaluate, then summarise
+bash tools/run_all_scenes.sh --gpu 0 --stage all real_caps real_cisco   # a subset, e.g. on a second GPU
+python tools/summarize_scenes.py                          # summary of whatever is finished
+```
+
+The source model iteration is the latest one in `point_cloud/` (override with `--iteration`). Finished steps are skipped, so the script can be restarted. **K check:** the same area in pixels corresponds to a different `K` in every scene. The model cannot represent `K < 101`. Scenes whose simulation warns about this are not trained, and are listed at the end.
+
+`tools/summarize_scenes.py` writes `output/scene_summary/scenes.md` and `scenes.csv`. The metrics are from the test split: AiF PSNR / SSIM / LPIPS, depth AbsRel / RMSE, and the point-cloud Chamfer distance and F@0.005. The summary contains:
+
+- the mean ± std over the scenes where all three methods were evaluated;
+- paired differences (densmax+L_dir − disk, orig − disk, densmax+L_dir − orig) with the number of scenes in which the first method is better;
+- per-scene tables, and the test PSNR side by side.
+
+The Chamfer distance is reported in % of the GT bounding-box diagonal, so that scenes of different scale can be averaged. Depth RMSE stays in scene units, so its mean over scenes is only indicative.
+
+---
+
 ## Directional all-in-focus loss (slit)
 
 DOF-GS supervises the all-in-focus (AiF) render directly only where a capture is in focus. Its in-focus mask is computed from the long-axis CoC `r_L`, so for a slit only pixels that are sharp in every direction are used. A slit capture at angle θ, however, is blurred strongly only along the long axis `u = (cos θ, sin θ)`. Along the short axis `v = (−sin θ, cos θ)`, the blur is `r_W = a·r_L`, so the capture still carries the scene detail across `v` over a depth range about `1/a` times larger.
@@ -595,6 +624,8 @@ tools/
   run_design_sweep.py        simulate -> train -> evaluate for several (n, a) designs
   collect_design_sweep.py    results table and measured-vs-theory plot
   list_runs.py               image, depth and point-cloud metrics of all evaluated runs
+  run_all_scenes.sh          slit (densmax+L_dir / original) vs disk on the 10 real DOF-GS scenes
+  summarize_scenes.py        per-scene and mean results of that comparison
   psf_render.py              layered rendering with box / disk / Gaussian PSFs and diffraction
 tests/
   test_slit_rasterizer.py    rasterizer smoke test (regression, anisotropy, gradients)

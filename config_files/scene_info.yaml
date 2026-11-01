@@ -118,3 +118,111 @@ slitsim_real_cake_n4_a0.40_check:
 disksim_real_cake_check:
   source_path: ./data/slit_sim/disksim_real_cake_check
   holdout: 8
+
+slitsim_real_caps:
+  source_path: ./data/slit_sim/slitsim_real_caps
+  holdout: 8
+
+slitsim_real_caps_n4_a0.40:
+  source_path: ./data/slit_sim/slitsim_real_caps_n4_a0.40
+  holdout: 8
+
+disksim_real_caps:
+  source_path: ./data/slit_sim/disksim_real_caps
+  holdout: 8
+
+slitsim_real_cisco:
+  source_path: ./data/slit_sim/slitsim_real_cisco
+  holdout: 8
+
+slitsim_real_cisco_n4_a0.40:
+  source_path: ./data/slit_sim/slitsim_real_cisco_n4_a0.40
+  holdout: 8
+
+disksim_real_cisco:
+  source_path: ./data/slit_sim/disksim_real_cisco
+  holdout: 8
+
+slitsim_real_coral:
+  source_path: ./data/slit_sim/slitsim_real_coral
+  holdout: 8
+
+slitsim_real_coral_n4_a0.40:
+  source_path: ./data/slit_sim/slitsim_real_coral_n4_a0.40
+  holdout: 8
+
+disksim_real_coral:
+  source_path: ./data/slit_sim/disksim_real_coral
+  holdout: 8
+
+slitsim_real_cupcake:
+  source_path: ./data/slit_sim/slitsim_real_cupcake
+  holdout: 8
+
+slitsim_real_cupcake_n4_a0.40:
+  source_path: ./data/slit_sim/slitsim_real_cupcake_n4_a0.40
+  holdout: 8
+
+disksim_real_cupcake:
+  source_path: ./data/slit_sim/disksim_real_cupcake
+  holdout: 8
+
+slitsim_real_cups:
+  source_path: ./data/slit_sim/slitsim_real_cups
+  holdout: 8
+
+slitsim_real_cups_n4_a0.40:
+  source_path: ./data/slit_sim/slitsim_real_cups_n4_a0.40
+  holdout: 8
+
+disksim_real_cups:
+  source_path: ./data/slit_sim/disksim_real_cups
+  holdout: 8
+
+slitsim_real_daisy:
+  source_path: ./data/slit_sim/slitsim_real_daisy
+  holdout: 8
+
+slitsim_real_daisy_n4_a0.40:
+  source_path: ./data/slit_sim/slitsim_real_daisy_n4_a0.40
+  holdout: 8
+
+disksim_real_daisy:
+  source_path: ./data/slit_sim/disksim_real_daisy
+  holdout: 8
+
+slitsim_real_sausage:
+  source_path: ./data/slit_sim/slitsim_real_sausage
+  holdout: 8
+
+slitsim_real_sausage_n4_a0.40:
+  source_path: ./data/slit_sim/slitsim_real_sausage_n4_a0.40
+  holdout: 8
+
+disksim_real_sausage:
+  source_path: ./data/slit_sim/disksim_real_sausage
+  holdout: 8
+
+slitsim_real_seal:
+  source_path: ./data/slit_sim/slitsim_real_seal
+  holdout: 8
+
+slitsim_real_seal_n4_a0.40:
+  source_path: ./data/slit_sim/slitsim_real_seal_n4_a0.40
+  holdout: 8
+
+disksim_real_seal:
+  source_path: ./data/slit_sim/disksim_real_seal
+  holdout: 8
+
+slitsim_real_tools:
+  source_path: ./data/slit_sim/slitsim_real_tools
+  holdout: 8
+
+slitsim_real_tools_n4_a0.40:
+  source_path: ./data/slit_sim/slitsim_real_tools_n4_a0.40
+  holdout: 8
+
+disksim_real_tools:
+  source_path: ./data/slit_sim/disksim_real_tools
+  holdout: 8
