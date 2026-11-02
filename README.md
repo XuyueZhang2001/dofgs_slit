@@ -132,8 +132,9 @@ To select a GPU, prefix the command with `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISI
    slit_angle_file: ''              # '' -> <source_path>/slit_angles.json
    slit_width_ratio: 0.1            # short/long ratio of the physical slit (initial value)
    slit_ratio_lr: 0.01              # set to 0 to keep the ratio fixed at slit_width_ratio
-   slit_share_F: true               # one focus distance for all views
-   slit_share_K: true               # one aperture scale for all views
+   share_F: group                   # one focus distance per focus group (default)
+   share_K: global                  # one aperture scale for all images (default)
+   focus_group_file: ''             # '' -> <source_path>/focus_groups.json, else grouped by camera pose
    slit_learn_theta_offset: true    # learn a global offset between nominal angles and image axes
    slit_theta_lr: 0.001
    coc_max: 15                      # initial max blur (px) used to initialise K
@@ -149,6 +150,22 @@ To select a GPU, prefix the command with `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISI
 
    At the start of training, the log prints the per-view angle table. At every save it prints the learned width ratio and angle offset. `--slit_sweep` writes `*_slitXXX.XX.png` renders at the requested angles.
 
+### Focus groups: sharing of F and K
+
+The focus distance `F` and the aperture scale `K` are camera parameters, so they are shared according to how the images were captured. This applies to slit and disk alike (`ModelParams`):
+
+| Option | Values | Default | Meaning |
+|---|---|---|---|
+| `share_F` | `global` / `group` / `view` | `group` | one `F` for all images / **one per focus group** / one per image |
+| `share_K` | `global` / `view` | `global` | **one `K` for all images** / one per image |
+| `focus_group_file` | path | `''` | JSON `{image_name: group}`; `''` reads `<source_path>/focus_groups.json` |
+
+A **focus group** is the set of images taken with one focus setting, for example the n slit angles at one position without refocusing, or the capture(s) of a disk at one position. If the camera refocuses at the same position, the new images form a new group. Without a focus-group file, the images that share a camera pose (identical R, T) form one group, and the log says so. For real slit data, write the file from the capture log or the EXIF focus information if the focus may change at one position.
+
+Older configs that set `slit_share_F` / `slit_share_K` (booleans) keep their behaviour: `true` maps to `global` and `false` to `view`, and they override `share_F` / `share_K`. The original DOF-GS learned one `F` and one `K` per image (in its real data, every photo was focused on a different object). To reproduce it exactly, set `share_F: view` and `share_K: view`. With the defaults, a disk dataset with one image per pose still gets one `F` per image, but a single `K`.
+
+The learned values are saved with their slot names. `tools/compare_slit_params.py` compares them with the ground truth of a simulated dataset, per focus group, for a slit or a disk.
+
 ---
 
 ## Simulation and evaluation
@@ -160,21 +177,25 @@ When no slit captures are available, a scene reconstructed by the original DOF-G
 ```shell
 python tools/simulate_slit_dataset.py --config ./config_files/config_real_cake.yaml \
     --scene real_cake --iteration 15000 \
-    --n_angles 4 --max_blur_px 20 --width_ratio 0.1
+    --n_angles 4 --max_blur_px 20 --width_ratio 0.1 --focus_mode global
 ```
 
-This writes `./data/slit_sim/slitsim_real_cake/`, which contains:
+This writes `./data/slit_sim/slitsim_real_cake/` (without `--focus_mode global`, `slitsim_real_cake_pf/`, see below), which contains:
 - `images/`: slit-blurred training views and AIF test views;
 - `aif/`: AIF ground truth of the training poses;
 - `defocus/*.npy`: per-pixel ground-truth blur length in px;
-- `sparse/0/`, `slit_angles.json`, `split.json`;
-- `sim_gt.json`: all ground-truth optics.
+- `sparse/0/`, `slit_angles.json`, `split.json`, `focus_groups.json` (image → pose);
+- `sim_gt.json`: all ground-truth optics, including the focus of every pose.
+
+**Per-pose focus (default, `--focus_mode per_pose`).** Every training pose focuses at its own depth, as if the camera focused on a random object at each position: `F_p = 1 / q_p`, where `q_p` is the `u_p`-quantile of the inverse depths of the Gaussians visible in that view, and `u_p` is uniform in `--focus_range` (default 0.2–0.8). `u_p` depends only on the source scene, the pose name and `--seed`, so a slit and a disk dataset of the same scene get identical focus distances. The n slit angles of a pose share its focus. The aperture size `K` is still defined at the reference focus (the median inverse depth, or the `--match_area` reference), so the aperture areas are the same as before. With a per-pose focus, the largest blur of a pose can exceed the reference value; the simulator prints the largest one. Datasets get the suffix `_pf`, and their training configs use `share_F: group`, `share_K: global`. `--focus_mode global` reproduces the earlier datasets (one focus for all poses, `share_F: global`). In the evaluation, the defocus bins of the depth errors use the focus of each training pose, and the reference focus for the all-in-focus test poses.
 
 The script also writes `config_files/config_slitsim_real_cake.yaml` and registers the scene. Useful options:
 
 | Option | Meaning |
 |---|---|
-| `--focus_quantile`, `--focus_depth` | focus distance, as a quantile of inverse depth or as an explicit value |
+| `--focus_mode` | `per_pose` (default, suffix `_pf`) or `global` (one focus for all poses) |
+| `--focus_range lo hi` | inverse-depth quantile range of the per-pose focus (default 0.2 0.8) |
+| `--focus_quantile`, `--focus_depth` | reference focus distance, as a quantile of inverse depth or as an explicit value (the focus of all poses with `--focus_mode global`) |
 | `--theta_bias_deg` | rendered angle = recorded angle + bias, to test learning of the angle offset |
 | `--noise_std` | additive Gaussian noise (std on [0, 1] images, at full exposure) on the defocused training captures; default 0 |
 | `--exposure`, `--noise_scaling` | relative exposure time of every capture (default 1) and how the noise grows when it is shorter: `shot` → σ/√e (default), `read` → σ/e |
@@ -342,19 +363,21 @@ This prints the estimated and ground-truth `F`, `K_L`, `K_W`, width ratio and an
 
 ## Multi-scene comparison (slit vs disk)
 
-`tools/run_all_scenes.sh` repeats the real_cake comparison on the 10 real DOF-GS scenes: `real_cake`, `real_caps`, `real_cisco`, `real_coral`, `real_cupcake`, `real_cups`, `real_daisy`, `real_sausage`, `real_seal` and `real_tools`. Each scene needs its data and the authors' pre-trained model in `output/model_dofgs/real_results/<scene>/`. The settings match real_cake. The aperture area is 40 px² at the largest defocus of each scene, from a reference dataset `slitsim_<scene>` with the original 20 × 2 px slit, and the focus is at the median inverse depth. The captures are noise-free, with the Gaussian PSF. Three models are trained per scene:
+`tools/run_all_scenes.sh` repeats the real_cake comparison on the 10 real DOF-GS scenes: `real_cake`, `real_caps`, `real_cisco`, `real_coral`, `real_cupcake`, `real_cups`, `real_daisy`, `real_sausage`, `real_seal` and `real_tools`. Each scene needs its data and the authors' pre-trained model in `output/model_dofgs/real_results/<scene>/`. The aperture area is 40 px² at the largest defocus for the reference focus (the median inverse depth). It comes from a reference dataset `slitsim_<scene>` with the original 20 × 2 px slit, simulated with one global focus. The captures use a **per-pose focus** (`_pf`): each pose focuses at a random depth, identical for slit and disk. Training shares one `F` per pose and one `K` over all images. The captures are noise-free, with the Gaussian PSF. Three models are trained per scene:
 
 | Method | Model |
 |---|---|
-| slit (densmax+L_dir) | n = 4, a = 0.4, `max_angle` densification + directional AiF loss 0.03 (defaults) → `slit_sim_dir0.03_densmax/slitsim_<scene>_n4_a0.40` |
-| slit (orig) | same data, no directional loss, `mean` densification → `slit_sim/slitsim_<scene>_n4_a0.40` |
-| disk | equal-area disk, one capture per pose → `slit_sim/disksim_<scene>` |
+| slit (densmax+L_dir) | n = 4, a = 0.4, `max_angle` densification + directional AiF loss 0.03 (defaults) → `slit_sim_dir0.03_densmax/slitsim_<scene>_n4_a0.40_pf` |
+| slit (orig) | same data, no directional loss, `mean` densification → `slit_sim/slitsim_<scene>_n4_a0.40_pf` |
+| disk | equal-area disk, one capture per pose → `slit_sim/disksim_<scene>_pf` |
+
+`--focus_mode global` (script) and `--suffix ""` (summary) use the earlier global-focus datasets instead. In those runs, the disk learned one `F` and `K` per image and the slit one shared `F` and `K`.
 
 ```shell
 bash tools/run_all_scenes.sh --gpu 1 --stage simulate     # datasets; checks that K is representable
 bash tools/run_all_scenes.sh --gpu 1 --stage train        # train + evaluate, then summarise
 bash tools/run_all_scenes.sh --gpu 0 --stage all real_caps real_cisco   # a subset, e.g. on a second GPU
-python tools/summarize_scenes.py                          # summary of whatever is finished
+python tools/summarize_scenes.py                          # summary of whatever is finished (_pf datasets)
 ```
 
 The source model iteration is the latest one in `point_cloud/` (override with `--iteration`). Finished steps are skipped, so the script can be restarted. **K check:** the same area in pixels corresponds to a different `K` in every scene. The model cannot represent `K < 101`. Scenes whose simulation warns about this are not trained, and are listed at the end.
@@ -590,7 +613,7 @@ The tests used `real_cake`, with n = 4 and a = 0.4 (10 × 4 px at the largest de
 
 With the default `--psf gaussian`, the slit reaches 31.98 dB (+2.8 dB over its inputs). With layered data, the recovered all-in-focus image is **worse than the blurred inputs**. It is blurred overall, with no blotches. In the `none` mode, the learned optics also drift (F −7.6 %, K +6.2 %). However, correct optics (`init`, `fixed`) do not help the slit and make the disk worse. The learned optics compensate for the error; they do not cause it.
 
-**Cause: the rasterizer's defocus is not a convolution.** The rasterizer adds the CoC covariance to each 2D splat, but keeps the splat's peak opacity. Its opacity coefficient only compensates the Mip-Splatting 2D filter. This is the same as in the original DOF-GS code. A physical blur of a splat lowers the peak by `sqrt(det Σ / det(Σ + ΔΣ))`, which can be a factor of tens for small splats. Without it, the blurred splats stay nearly opaque. Each pixel then mostly takes the colour of the front-most enlarged splats, instead of averaging its neighbourhood. When the data are blurred physically, the true scene is not a solution of the fitting problem. The optimiser dims and spreads the fine details, which bakes the blur into the scene, so the all-in-focus render comes out blurred. Different views and slit angles require different compensations. The slit suffers more than the disk, also because the slit shares F and K across all views (`slit_share_F/K: true`), while the disk, like the original DOF-GS, learns them per view.
+**Cause: the rasterizer's defocus is not a convolution.** The rasterizer adds the CoC covariance to each 2D splat, but keeps the splat's peak opacity. Its opacity coefficient only compensates the Mip-Splatting 2D filter. This is the same as in the original DOF-GS code. A physical blur of a splat lowers the peak by `sqrt(det Σ / det(Σ + ΔΣ))`, which can be a factor of tens for small splats. Without it, the blurred splats stay nearly opaque. Each pixel then mostly takes the colour of the front-most enlarged splats, instead of averaging its neighbourhood. When the data are blurred physically, the true scene is not a solution of the fitting problem. The optimiser dims and spreads the fine details, which bakes the blur into the scene, so the all-in-focus render comes out blurred. Different views and slit angles require different compensations. The slit suffers more than the disk, also because in these runs the slit shared F and K across all views (`slit_share_F/K: true`, i.e. `share_F: global`), while the disk, like the original DOF-GS, learned them per view.
 
 **Why DOF-GS still works on real photos.** On the real Deblur-NeRF defocus scenes, its reported AiF PSNR (24.12 dB) is comparable to other deblurring methods and 1.4–2.9 dB above methods that do not model blur. It is not a near-perfect deblurring. Per-view learnable focus and aperture can absorb part of the model error, and the in-focus localisation supervises the all-in-focus render directly where the captures are sharp.
 
@@ -598,7 +621,7 @@ With the default `--psf gaussian`, the slit reaches 31.98 dB (+2.8 dB over its i
 
 - **Use the default `--psf gaussian`** for aperture-design studies (n, a, noise, exposure). Results then compare slit and disk *within the DOF-GS blur model*. They test the optimisation and the aperture design, but not physical accuracy. State this when reporting them.
 - Keep `gaussian_layered` / `box` for model-mismatch studies.
-- For real slit data, consider per-view optics (`slit_share_F: false`, `slit_share_K: false`), which gives the slit the same compensation as the original DOF-GS.
+- For real slit data, share `F` per focus group (`share_F: group`, the default) rather than globally. Per-image optics (`share_F: view`, `share_K: view`) give the slit the same freedom to compensate as the original DOF-GS.
 - A physically consistent fix would scale each splat's opacity by `sqrt(det Σ / det(Σ + ΔΣ))` (energy-conserving CoC). This is not implemented.
 
 ---
@@ -631,8 +654,10 @@ tests/
   test_slit_rasterizer.py    rasterizer smoke test (regression, anisotropy, gradients)
   test_directional_loss.py   CPU checks of the directional all-in-focus loss
   test_psf_render.py         CPU checks of the PSF kernels and layered compositing
+  test_focus_groups.py       CPU checks of focus groups, F / K sharing and per-pose focus
 src/utils/slit_utils.py      slit angle loading, grouping of images by camera pose
 src/utils/directional_loss.py  directional all-in-focus loss for slit captures
+src/utils/focus_utils.py     focus groups, sharing of F / K, per-pose focus
 ```
 
 ---

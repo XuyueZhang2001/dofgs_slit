@@ -17,6 +17,7 @@ from src.utils.ops import (
     qvec2rotmat_batched,
 )
 from src.model_dofgs.neural_module import MaskNet
+from src.utils.focus_utils import param_index, slot_means
 
 # Variance coefficients of the Gaussian approximation of the defocus PSF.
 # DISK: original DOF-GS value for a circular aperture, 1 / (2 ln 4).
@@ -84,7 +85,11 @@ class GaussianModel:
         self.slit_ratio_raw = None   # logit of (short-axis / long-axis) aperture ratio
         self.theta_offset = None     # global orientation offset (radians)
         self.thetas_known = None     # (N_view, 1) known slit angles (radians)
-        
+        # Sharing of F / K: view -> parameter-slot indices (see setup_defocus_params)
+        self.share_F_mode, self.share_K_mode = None, None
+        self.f_index, self.k_index = None, None
+        self.f_slot_names, self.k_slot_names = [], []
+
 
     def capture(self):
         return (
@@ -261,11 +266,16 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         
     def setup_defocus_params(self, N_view, camera_translate, dataset_path, mask_act='binary', COC_MAX=15,
-                             slit_cfg=None, optics=None):
+                             slit_cfg=None, optics=None, share_cfg=None):
         """
-        optics: None, or a dict {'F': focus distance, 'K': aperture scale (K_L / K_D),
-            'ratio': slit width ratio} used as the initial values instead of the
-            depth-based guess (e.g. the ground truth of a simulated dataset).
+        share_cfg: None, or a dict {'F': 'global' | 'group' | 'view', 'K': 'global' | 'view',
+            'groups': LongTensor (N_view,) of focus-group ids} (src/utils/focus_utils.py).
+            None keeps the older behaviour: slit_cfg share_F / share_K for a slit,
+            one F and K per view for a disk.
+        optics: None, or a dict {'F': focus distance, 'F_view': optional per-view focus
+            distances, 'K': aperture scale (K_L / K_D), 'ratio': slit width ratio} used
+            as the initial values instead of the depth-based guess (e.g. the ground
+            truth of a simulated dataset).
         slit_cfg: None for the original circular aperture, otherwise a dict with
             'thetas'             : (N_view, 1) known slit angles in radians, in view-index order
             'width_ratio'        : initial short-axis / long-axis aperture ratio, in (0, 1)
@@ -296,10 +306,29 @@ class GaussianModel:
             self.slit_share_F = False
             self.slit_share_K = False
 
-        # A shared parameter is stored as a single row and expanded to N_view
-        # in get_defocus_params().
-        n_F = 1 if self.slit_share_F else N_view
-        n_K = 1 if self.slit_share_K else N_view
+        # One parameter per slot; get_defocus_params() gathers them per view with
+        # f_index / k_index (src/utils/focus_utils.py).
+        if share_cfg is None:
+            f_mode = 'global' if self.slit_share_F else 'view'
+            k_mode = 'global' if self.slit_share_K else 'view'
+            groups = torch.arange(N_view, dtype=torch.long)
+        else:
+            f_mode, k_mode = share_cfg['F'], share_cfg['K']
+            groups = torch.as_tensor(share_cfg['groups'], dtype=torch.long).reshape(-1)
+            assert groups.numel() == N_view, 'focus groups must be given for every training view'
+        self.share_F_mode, self.share_K_mode = f_mode, k_mode
+        f_index, k_index = param_index(f_mode, groups), param_index(k_mode, groups)
+        # names of the parameter slots (for comparisons with a ground truth)
+        view_names = list((share_cfg or {}).get('view_names') or [])
+        group_names = list((share_cfg or {}).get('group_names') or [])
+        slot_names = {'global': ['all'], 'group': group_names, 'view': view_names}
+        self.f_slot_names, self.k_slot_names = slot_names[f_mode], slot_names[k_mode]
+        self.f_index, self.k_index = f_index.to(self.device), k_index.to(self.device)
+        # kept for compatibility with code reading the older flags
+        self.slit_share_F, self.slit_share_K = f_mode == 'global', k_mode == 'global'
+        n_F, n_K = int(f_index.max()) + 1, int(k_index.max()) + 1
+        print(f'Defocus parameters: share_F={f_mode} ({n_F} focus distance(s)), '
+              f'share_K={k_mode} ({n_K} aperture scale(s)) for {N_view} views')
 
         self.Fs = torch.ones(n_F, 1)
         self.Fs = self.Fs * z_median                         
@@ -312,9 +341,15 @@ class GaussianModel:
             #   F = clamp(Fs, 0.01, 1000) * 10,  K = clamp(Ks, 0.01, 200) * 100 + 100
             if optics['K'] < 101.0:
                 print(f"[WARN] K = {optics['K']:.1f} is below the smallest representable K (101)")
-            self.Fs = torch.full((n_F, 1), float(optics['F']) / 10.0, device=self.device)
+            if optics.get('F_view') is not None:
+                # per-view ground truth -> mean over the views of every slot
+                self.Fs = (slot_means(optics['F_view'], f_index) / 10.0).reshape(n_F, 1).to(self.device)
+            else:
+                self.Fs = torch.full((n_F, 1), float(optics['F']) / 10.0, device=self.device)
             self.Ks = torch.full((n_K, 1), (float(optics['K']) - 100.0) / 100.0, device=self.device)
-            print(f"Defocus parameters from given optics: F = {optics['F']:.4f}, K = {optics['K']:.2f}"
+            F_init = self.Fs.squeeze(1) * 10.0
+            print(f"Defocus parameters from given optics: F = {F_init.min().item():.4f}"
+                  + (f"..{F_init.max().item():.4f}" if n_F > 1 else "") + f", K = {optics['K']:.2f}"
                   + (f", width ratio = {optics['ratio']:.4f}" if slit_cfg is not None else ""))
 
         self.Fs = nn.Parameter(self.Fs.requires_grad_(True))
@@ -333,7 +368,7 @@ class GaussianModel:
             self.theta_offset = nn.Parameter(
                 torch.zeros((1, 1), device=self.device).requires_grad_(self.slit_learn_theta_offset))
             print(f'Slit aperture: {N_view} views, width ratio init {ratio:.3f}, '
-                  f'share_F={self.slit_share_F}, share_K={self.slit_share_K}, '
+                  f'share_F={f_mode}, share_K={k_mode}, '
                   f'learn_theta_offset={self.slit_learn_theta_offset}')
         self.optimize_defocus = False
         self.mask_net = MaskNet(N_view, act_type=mask_act)
@@ -348,13 +383,12 @@ class GaussianModel:
         the rasterizer. Returns (F, K, Kw, theta), each (N_view, 1); Kw and theta
         are None for the original circular aperture.
         """
-        F = torch.clamp(self.Fs, 0.01, 1000) * 10.0
-        K = torch.clamp(self.Ks, 0.01, 200) * 100.0 + 100.0
+        self._ensure_param_indices()
+        F = (torch.clamp(self.Fs, 0.01, 1000) * 10.0)[self.f_index]
+        K = (torch.clamp(self.Ks, 0.01, 200) * 100.0 + 100.0)[self.k_index]
         if self.aperture_type != 'slit':
             return F, K, None, None
 
-        F = F.expand(self.n_view, 1)
-        K = K.expand(self.n_view, 1)
         # The short axis is tied to the long axis through a ratio in (0, 1),
         # which keeps Kw < K and reflects the fixed physical slit shape.
         Kw = K * torch.sigmoid(self.slit_ratio_raw)
@@ -389,6 +423,25 @@ class GaussianModel:
                 self.optimizer.add_param_group({'params': [self.theta_offset],
                                                 'lr': training_args.slit_theta_lr, "name": "slit_theta"})
 
+    def _ensure_param_indices(self):
+        """
+        View -> parameter-slot indices for F and K. Parameters saved before focus
+        groups existed hold either one row (shared) or one row per view.
+        """
+        if getattr(self, 'f_index', None) is None or getattr(self, 'k_index', None) is None:
+            n_view = max(int(self.n_view or 1), self.Fs.shape[0], self.Ks.shape[0])
+            self.n_view = n_view
+            dev = self.Fs.device
+            def legacy(rows):
+                return (torch.zeros(n_view, dtype=torch.long, device=dev) if rows == 1
+                        else torch.arange(n_view, dtype=torch.long, device=dev))
+            self.f_index = legacy(self.Fs.shape[0])
+            self.k_index = legacy(self.Ks.shape[0])
+            self.share_F_mode = 'global' if self.Fs.shape[0] == 1 else 'view'
+            self.share_K_mode = 'global' if self.Ks.shape[0] == 1 else 'view'
+        if self.f_index.device != self.Fs.device:
+            self.f_index, self.k_index = self.f_index.to(self.Fs.device), self.k_index.to(self.Fs.device)
+
     def aperture_state_dict(self):
         def cpu(t):
             return None if t is None else t.detach().cpu()
@@ -398,6 +451,12 @@ class GaussianModel:
             'n_view': self.n_view,
             'share_F': self.slit_share_F,
             'share_K': self.slit_share_K,
+            'share_F_mode': getattr(self, 'share_F_mode', None),
+            'share_K_mode': getattr(self, 'share_K_mode', None),
+            'f_index': cpu(getattr(self, 'f_index', None)),
+            'k_index': cpu(getattr(self, 'k_index', None)),
+            'f_slot_names': list(getattr(self, 'f_slot_names', []) or []),
+            'k_slot_names': list(getattr(self, 'k_slot_names', []) or []),
             'learn_theta_offset': self.slit_learn_theta_offset,
             'slit_ratio_raw': cpu(self.slit_ratio_raw),
             'theta_offset': cpu(self.theta_offset),
@@ -411,6 +470,14 @@ class GaussianModel:
         self.slit_share_F = state['share_F']
         self.slit_share_K = state['share_K']
         self.slit_learn_theta_offset = state['learn_theta_offset']
+        # view -> slot indices (None for parameters saved before focus groups existed;
+        # they are then derived from the parameter shapes in _ensure_param_indices)
+        self.share_F_mode, self.share_K_mode = state.get('share_F_mode'), state.get('share_K_mode')
+        f_index, k_index = state.get('f_index'), state.get('k_index')
+        self.f_index = None if f_index is None else f_index.long().to(self.device)
+        self.k_index = None if k_index is None else k_index.long().to(self.device)
+        self.f_slot_names = state.get('f_slot_names') or []
+        self.k_slot_names = state.get('k_slot_names') or []
         if self.aperture_type == 'slit':
             self.slit_ratio_raw = nn.Parameter(state['slit_ratio_raw'].to(self.device).requires_grad_(True))
             self.theta_offset = nn.Parameter(
@@ -501,9 +568,13 @@ class GaussianModel:
         mask_net_dict = state_dict['mask_net_dict']
         if 'aperture' in state_dict:
             self.load_aperture_state_dict(state_dict['aperture'])
-        
+        else:
+            # original DOF-GS parameters: derive the indices from the parameter shapes
+            self.f_index, self.k_index = None, None
+
         self.Fs = self.Fs.to(self.device)
         self.Ks = self.Ks.to(self.device)
+        self._ensure_param_indices()
         self.mask_net.load_state_dict(mask_net_dict)
         self.mask_net = self.mask_net.to(self.device)
         

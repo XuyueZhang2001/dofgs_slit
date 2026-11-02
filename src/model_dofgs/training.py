@@ -17,6 +17,7 @@ import numpy as np
 import math
 from src.utils.slit_utils import load_slit_angles, group_views_by_pose
 from src.utils.directional_loss import slit_directional_aif_loss
+from src.utils.focus_utils import resolve_share_modes, load_focus_groups, build_view_groups
    
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -118,10 +119,12 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
         
     gaussians.compute_3D_filter(cameras=trainCameras)
 
+    # image names in view-index order (the order of the defocus parameters)
+    view_names = sorted(mapping_dict.keys(), key=lambda n: mapping_dict[n])
+
     # Slit aperture: per-view known angles, in the same view-index order as mapping_dict.
     slit_cfg = None
     if getattr(dataset, 'aperture_type', 'disk') == 'slit':
-        view_names = sorted(mapping_dict.keys(), key=lambda n: mapping_dict[n])
         slit_thetas = load_slit_angles(view_names,
                                        angle_file=getattr(dataset, 'slit_angle_file', ''),
                                        source_path=dataset.source_path,
@@ -129,8 +132,6 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
         slit_cfg = {
             'thetas': slit_thetas,
             'width_ratio': getattr(dataset, 'slit_width_ratio', 0.1),
-            'share_F': getattr(dataset, 'slit_share_F', True),
-            'share_K': getattr(dataset, 'slit_share_K', True),
             'learn_theta_offset': getattr(dataset, 'slit_learn_theta_offset', True),
         }
         print('Slit angles (deg): ' + ', '.join(
@@ -149,12 +150,41 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
             sim_gt = json.load(f)
         optics = dict(F=float(sim_gt['focus_distance']), K=float(sim_gt['K_long']),
                       ratio=float(sim_gt['K_short']) / float(sim_gt['K_long']))
-        print(f"Optics from {gt_path} ({optics_mode}): F = {optics['F']:.4f}, K = {optics['K']:.2f}, "
-              f"ratio = {optics['ratio']:.4f}")
+        if sim_gt.get('focus_per_group'):
+            # per-group ground truth (per-pose focus): focus distance of every view
+            sim_groups = load_focus_groups(os.path.join(dataset.source_path, 'focus_groups.json')) or {}
+            optics['F_view'] = [float(sim_gt['focus_per_group'][sim_groups[n]]) for n in view_names]
+        print(f"Optics from {gt_path} ({optics_mode}): "
+              + (f"F = {min(optics['F_view']):.4f}..{max(optics['F_view']):.4f} (per group)"
+                 if 'F_view' in optics else f"F = {optics['F']:.4f}")
+              + f", K = {optics['K']:.2f}, ratio = {optics['ratio']:.4f}")
+
+    # Sharing of F / K: F per focus group (default), K global (default); legacy
+    # slit_share_F / slit_share_K booleans of older configs take precedence.
+    share_F, share_K = resolve_share_modes(getattr(dataset, 'share_F', 'group'),
+                                           getattr(dataset, 'share_K', 'global'),
+                                           getattr(dataset, 'slit_share_F', ''),
+                                           getattr(dataset, 'slit_share_K', ''))
+    group_file = getattr(dataset, 'focus_group_file', '') or os.path.join(dataset.source_path, 'focus_groups.json')
+    group_of_name = load_focus_groups(group_file)
+    if group_of_name is not None:
+        print(f'Focus groups from {group_file}')
+    else:
+        # no focus-group file: one focus setting per camera pose
+        group_of_name = {}
+        for g, members in enumerate(group_views_by_pose(scene.getTrainCameras())):
+            for _, cam in members:
+                group_of_name[cam.image_name] = f'pose{g:04d}'
+        if share_F == 'group':
+            print('[INFO] no focus-group file: images that share a camera pose form one focus group')
+    view_groups, group_names = build_view_groups(view_names, group_of_name)
+    share_cfg = {'F': share_F, 'K': share_K, 'groups': view_groups,
+                 'view_names': view_names, 'group_names': group_names}
+    print(f'{len(group_names)} focus group(s) for {len(view_names)} training images')
 
     gaussians.setup_defocus_params(len(viewpoint_stack), scene.cameras_translate,
                                     dataset.source_path, mask_act='sigmoid', COC_MAX=dataset.coc_max,
-                                    slit_cfg=slit_cfg, optics=optics)
+                                    slit_cfg=slit_cfg, optics=optics, share_cfg=share_cfg)
     if optics_mode == 'fixed':
         # F, K, width ratio and theta offset receive no gradients; the optimizer skips them
         gaussians.freeze_defocus_params()

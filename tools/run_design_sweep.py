@@ -65,6 +65,15 @@ Known optics (simulated datasets)
                       Applies to slit and disk; adds _optinit / _optfixed to the
                       model_folder (e.g. slit_sim_optfixed).
 
+Focus of the simulated captures
+  --focus_mode per_pose|global
+                      per_pose (default): every pose focuses at its own random depth
+                      (inverse-depth quantile in --focus_range, default 0.2 0.8); the
+                      n slit angles of a pose share it. Datasets get the suffix _pf and
+                      are trained with one focus distance per pose (share_F: group) and
+                      one aperture scale (share_K: global). global: one focus for all
+                      poses (the earlier datasets, unsuffixed names).
+
 PSF model (see tools/simulate_slit_dataset.py and tools/psf_render.py)
   --psf gaussian|box|gaussian_layered
                       PSF of the simulated captures; slit and disk use the same model.
@@ -143,6 +152,11 @@ def parse_args():
     p.add_argument("--optics", choices=["none", "init", "fixed"], default="none",
                    help="ground-truth optics (sim_gt.json) for training: none (learned from a depth-based guess), "
                         "init (ground truth as initial value, learned) or fixed (frozen); adds _opt<mode>")
+    p.add_argument("--focus_mode", choices=["per_pose", "global"], default="per_pose",
+                   help="focus of the simulated captures: per_pose (default, a random focus per pose, "
+                        "datasets with suffix _pf) or global (one focus for all poses, the earlier datasets)")
+    p.add_argument("--focus_range", type=float, nargs=2, default=[0.2, 0.8],
+                   help="(per_pose) inverse-depth quantile range of the per-pose focus")
     p.add_argument("--psf", choices=["gaussian", "box", "gaussian_layered"], default="gaussian",
                    help="PSF model of the simulated captures (see tools/simulate_slit_dataset.py); "
                         "slit and disk always use the same model")
@@ -330,6 +344,11 @@ def main():
     # PSF model: same scene-name suffix as tools/simulate_slit_dataset.py (psf_suffix)
     ptag = PSF_SUFFIX[a.psf] + ("_diff" if a.diffraction else "")
     psf_args = ["--psf", a.psf] + (["--diffraction"] if a.diffraction else [])
+    # focus of the simulated captures (same scene-name suffix as tools/simulate_slit_dataset.py)
+    ftag = "_pf" if a.focus_mode == "per_pose" else ""
+    psf_args += ["--focus_mode", a.focus_mode, "--focus_range", repr(a.focus_range[0]), repr(a.focus_range[1])]
+    print(f"Focus of the simulated captures: {a.focus_mode}"
+          + (f" (inverse-depth quantile {a.focus_range[0]:g}..{a.focus_range[1]:g})" if ftag else ""))
     if a.psf != "gaussian":
         print(f"PSF model of the simulated captures: {a.psf}" + (" + diffraction" if a.diffraction else ""))
 
@@ -341,7 +360,7 @@ def main():
         e = slit_exposure_for(a, n)
         slit_ns.append(n)
         slit_totals.append(n * e)
-        name = f"slitsim_{a.scene}_n{n}_a{r:.2f}{tag}{exposure_tag(a, e)}{ptag}"
+        name = f"slitsim_{a.scene}_n{n}_a{r:.2f}{tag}{exposure_tag(a, e)}{ftag}{ptag}"
         jobs.append((name, ["--n_angles", str(n), "--width_ratio", str(r), "--exposure", repr(e),
                             "--noise_scaling", a.noise_scaling] + psf_args, n))
         if a.noise_std > 0:
@@ -355,7 +374,8 @@ def main():
             if any(abs(t - copies * e_d) > 1e-6 for t in slit_totals):
                 print(f"[WARN] the total exposure per pose differs between the slit designs "
                       f"({', '.join(f'{t:.4g}' for t in slit_totals)}) and the disk ({copies * e_d:.4g}).")
-        name = f"disksim_{a.scene}" + (f"_c{copies}" if copies > 1 else "") + tag + exposure_tag(a, e_d) + ptag
+        name = (f"disksim_{a.scene}" + (f"_c{copies}" if copies > 1 else "") + tag + exposure_tag(a, e_d)
+                + ftag + ptag)
         jobs.append((name, ["--aperture", "disk", "--disk_copies", str(copies), "--exposure", repr(e_d),
                             "--noise_scaling", a.noise_scaling] + psf_args, copies))
 

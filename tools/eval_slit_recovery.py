@@ -130,14 +130,20 @@ def distance_to_z(dist, cam):
 
 
 class DepthMetrics:
-    """Per-view depth errors plus pooled AbsRel per relative-defocus bin."""
+    """
+    Per-view depth errors plus pooled AbsRel per relative-defocus bin.
+    focus: reference focus distance; focus_of: optional {pose name: focus} of
+    per-pose-focus datasets (training poses), used instead of the reference.
+    """
 
-    def __init__(self, focus, d_max):
+    def __init__(self, focus, d_max, focus_of=None):
         self.focus, self.d_max = focus, d_max
+        self.focus_of = focus_of or {}
         self.bin_sum = defaultdict(lambda: np.zeros(len(DEFOCUS_BINS) - 1))
         self.bin_cnt = defaultdict(lambda: np.zeros(len(DEFOCUS_BINS) - 1))
 
-    def __call__(self, split, cam, d_rec, a_rec, d_gt, a_gt):
+    def __call__(self, split, cam, d_rec, a_rec, d_gt, a_gt, pose=None):
+        focus = self.focus_of.get(pose, self.focus)
         valid_gt = (a_gt > 0.5) & torch.isfinite(d_gt) & (d_gt > 1e-6)
         valid = valid_gt & (a_rec > 0.5) & torch.isfinite(d_rec) & (d_rec > 1e-6)
         n_gt = int(valid_gt.sum())
@@ -153,7 +159,7 @@ class DepthMetrics:
                  coverage=float(valid.sum()) / max(n_gt, 1))
         # defocus of every valid pixel from the GT depth: |1/z - 1/F| / d_max
         z = distance_to_z(d_gt, cam)[valid]
-        rd = ((1.0 / z - 1.0 / self.focus).abs() / self.d_max).cpu().numpy()
+        rd = ((1.0 / z - 1.0 / focus).abs() / self.d_max).cpu().numpy()
         r = rel.cpu().numpy()
         idx = np.clip(np.digitize(rd, DEFOCUS_BINS) - 1, 0, len(DEFOCUS_BINS) - 2)
         self.bin_sum[split] += np.bincount(idx, weights=r, minlength=len(DEFOCUS_BINS) - 1)
@@ -280,7 +286,9 @@ def main():
     if do_3d:
         gt_gauss, gt_band_limit, gt_kernel = load_source_model(a, sim_gt, scene_dict)
         d_max = sim_gt.get("d_max") or sim_gt["max_blur_px"] / sim_gt["K_long"]
-        depth_metrics = DepthMetrics(sim_gt["focus_distance"], d_max)
+        # per-pose focus datasets: training poses use their own focus, test poses
+        # (all-in-focus) the reference focus
+        depth_metrics = DepthMetrics(sim_gt["focus_distance"], d_max, sim_gt.get("focus_per_group"))
 
     out_dir = os.path.join(dataset.model_path, f"eval_slit_recovery/iteration_{a.iteration}")
     img_dir = os.path.join(out_dir, "strips")
@@ -299,7 +307,7 @@ def main():
     def eval_depth(split, name, cam):
         d_rec, a_rec = aif_depth(cam, gaussians, pipe, band_limit, kernel_size)
         d_gt, a_gt = aif_depth(cam, gt_gauss, pipe, gt_band_limit, gt_kernel)
-        m = depth_metrics(split, cam, d_rec, a_rec, d_gt, a_gt)
+        m = depth_metrics(split, cam, d_rec, a_rec, d_gt, a_gt, pose=name)
         if m is not None:
             depth_split[split].append(m)
             depth_rows.append(dict(split=split, pose=name, **m))

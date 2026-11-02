@@ -68,10 +68,21 @@ class ModelParams(ParamGroup):
         self.slit_angle_regex = ''
         # Initial short-axis / long-axis aperture ratio of the slit.
         self.slit_width_ratio = 0.4
-        # Share one focus distance / aperture scale across all views (same lens
-        # setting for the whole capture). Set to false to learn them per view.
-        self.slit_share_F = True
-        self.slit_share_K = True
+        # Sharing of the defocus parameters (slit and disk alike; src/utils/focus_utils.py):
+        #   share_F: 'group' (default): one focus distance per focus group, i.e. the
+        #            images taken with one focus setting (e.g. the n slit angles at one
+        #            position); 'global': one for all images; 'view': one per image
+        #   share_K: 'global' (default): one aperture scale for all images; 'view': per image
+        self.share_F = 'group'
+        self.share_K = 'global'
+        # JSON {image_name: focus_group}; empty -> <source_path>/focus_groups.json,
+        # and without that file the images are grouped by camera pose.
+        self.focus_group_file = ''
+        # Legacy flags of older configs: true -> 'global', false -> 'view'. Empty
+        # (default) means not set; when set they override share_F / share_K so that
+        # older runs are reproduced.
+        self.slit_share_F = ''
+        self.slit_share_K = ''
         # Learn a global offset between the nominal slit angles and the image axes.
         self.slit_learn_theta_offset = True
         # Optics of simulated datasets (<source_path>/sim_gt.json: focus distance F,

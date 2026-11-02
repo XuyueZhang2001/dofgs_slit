@@ -80,6 +80,21 @@ defaults (50 mm lens, 40 mm^2 aperture, i.e. a 10 x 4 mm slit at a = 0.4 or a
 measured system. All-in-focus references and test views stay ideal.
 Non-default PSFs add the suffix _box / _glayer (and _diff) to the scene name.
 
+Focus (--focus_mode). per_pose (default): every training pose gets its own
+focus distance, as if the camera focused on a random object at each position:
+F_p = 1 / q_p, where q_p is the u_p-quantile of the inverse depths of the
+Gaussians visible in that view and u_p is drawn uniformly from --focus_range
+(default 0.2 .. 0.8). u_p depends only on (source scene, pose name, --seed), so a
+slit and a disk dataset of the same scene get identical focus distances. The
+n slit angles of a pose share its focus. global: one focus distance for all
+poses (the median inverse depth, or --focus_quantile / --focus_depth / the
+--match_area reference), as in the earlier datasets. The aperture size K is
+defined at the reference focus in both modes (area at its largest defocus), so
+--match_area / --area_px2 mean the same thing as before. Per-pose focus datasets
+get the suffix _pf; they also contain focus_groups.json ({image: pose}), which
+the training uses to share one F per focus group (share_F: group) and one K
+over all images (share_K: global).
+
 Usage (from the repository root):
     # original design: 20 px x 2 px slit at maximal defocus
     python tools/simulate_slit_dataset.py --config ./config_files/config_real_cake.yaml \
@@ -114,6 +129,7 @@ from src.model_dofgs.gaussian_model import GaussianModel, SLIT_APERTURE_COEFF
 DISK_UNIFORM_COEFF = 0.25
 from src.model_dofgs.renderer import render, ToneMapping
 import psf_render
+from src.utils.focus_utils import pose_focus_fraction
 from aperture_theory import (evenly_spaced_angles, max_offset_deg, optimal_ratio,
                              summarize as theory_summary)
 
@@ -141,6 +157,11 @@ def parse_args():
     p.add_argument("--focus_quantile", type=float, default=0.5,
                    help="focus distance as a quantile of the inverse scene depth (0 = far, 1 = near)")
     p.add_argument("--focus_depth", type=float, default=None, help="explicit focus distance, overrides --focus_quantile")
+    p.add_argument("--focus_mode", choices=["per_pose", "global"], default="per_pose",
+                   help="per_pose (default): a random focus distance per training pose (suffix _pf); "
+                        "global: one focus distance for all poses (earlier datasets)")
+    p.add_argument("--focus_range", type=float, nargs=2, default=[0.2, 0.8],
+                   help="(per_pose) range of the inverse-depth quantile of the per-pose focus (0 = far, 1 = near)")
     p.add_argument("--theta_bias_deg", type=float, default=0.0,
                    help="systematic offset between rendered and recorded angles (tests theta-offset learning)")
     p.add_argument("--noise_std", type=float, default=0.0,
@@ -200,6 +221,8 @@ def parse_args():
         p.error("--diffraction needs a layered PSF: use --psf box or --psf gaussian_layered")
     if a.n_layers < 1 or a.supersample < 1:
         p.error("--n_layers and --supersample must be >= 1")
+    if not 0.0 <= a.focus_range[0] < a.focus_range[1] <= 1.0:
+        p.error("--focus_range must satisfy 0 <= lo < hi <= 1")
     return a
 
 
@@ -329,13 +352,14 @@ def defocus_map(cam, gaussians, pipe, F, K_L, band_limit, kernel_size):
     return out.cpu().numpy().astype("float32")
 
 
-def write_defocus_maps(out, cams, gaussians, pipe, F, K_L, band_limit, kernel_size):
+def write_defocus_maps(out, cams, gaussians, pipe, focus_for, K_L, band_limit, kernel_size):
+    """focus_for(cam) -> focus distance of that camera (per-pose focus, or the reference)."""
     import numpy as np
     d_dir = os.path.join(out, "defocus")
     os.makedirs(d_dir, exist_ok=True)
     for cam in cams:
         np.save(os.path.join(d_dir, f"{cam.image_name}.npy"),
-                defocus_map(cam, gaussians, pipe, F, K_L, band_limit, kernel_size))
+                defocus_map(cam, gaussians, pipe, focus_for(cam), K_L, band_limit, kernel_size))
     print(f"Wrote {len(cams)} ground-truth defocus maps to {d_dir}")
 
 
@@ -362,6 +386,8 @@ def main():
         base += f"_n{a.n_angles}_a{ratio:.2f}"      # design sweeps get distinct scene names
     if a.noise_std > 0 and a.exposure != 1.0:
         base += f"_e{a.exposure:.4g}_{a.noise_scaling}"
+    if a.focus_mode == "per_pose":
+        base += "_pf"                                # per-pose focus
     base += psf_suffix(a.psf, a.diffraction)
     new_scene = a.new_scene or base
 
@@ -395,7 +421,9 @@ def main():
     if a.defocus_only:
         with open(os.path.join(out, "sim_gt.json")) as f:
             gt = json.load(f)
-        write_defocus_maps(out, train_cams + test_cams, gaussians, pipe, gt["focus_distance"], gt["K_long"],
+        per_group = gt.get("focus_per_group") or {}
+        write_defocus_maps(out, train_cams + test_cams, gaussians, pipe,
+                           lambda cam: per_group.get(cam.image_name, gt["focus_distance"]), gt["K_long"],
                            band_limit, kernel_size)
         return
 
@@ -451,6 +479,27 @@ def main():
         print(f"[WARN] K = {K_L:.1f} is below the smallest K the model can represent ({K_MIN_REPRESENTABLE:.0f}); "
               f"the model cannot fit it. Use a larger blur or area.")
 
+    # ---- focus distance of every training pose ----
+    # F above is the reference focus that defines the aperture size; with per-pose
+    # focus each pose gets its own focus (shared by its n slit angles).
+    focus_of, d_max_pose = {}, []
+    for cam in train_cams:
+        if a.focus_mode == "per_pose":
+            iv = visible_inverse_depths(gaussians, [cam], seed=a.seed).float()
+            u = pose_focus_fraction(a.scene, cam.image_name, a.seed, *a.focus_range)
+            Fp = 1.0 / torch.quantile(iv, u).item()
+            q05, q95 = torch.quantile(iv, 0.05).item(), torch.quantile(iv, 0.95).item()
+            d_max_pose.append(max(abs(q95 - 1.0 / Fp), abs(1.0 / Fp - q05)))
+        else:
+            Fp = F
+        focus_of[cam.image_name] = Fp
+    if a.focus_mode == "per_pose":
+        fv = sorted(focus_of.values())
+        print(f"Per-pose focus ({len(fv)} poses, inverse-depth quantile {a.focus_range[0]:g}..{a.focus_range[1]:g}): "
+              f"F = {fv[0]:.4f} .. {fv[-1]:.4f} (median {fv[len(fv) // 2]:.4f}; reference {F:.4f})")
+        print(f"Largest blur over the poses (5-95% depth of each view): {K_L * max(d_max_pose):.2f} px "
+              f"along the long axis (reference {max_blur:.2f} px)")
+
     # ---- output folders ----
     if os.path.exists(out):
         shutil.rmtree(out)
@@ -461,8 +510,9 @@ def main():
     src_sparse = os.path.join(dataset.source_path, "sparse/0")
     extr_by_stem, intr = read_colmap(src_sparse)
 
-    def render_img(cam, K, Kw, theta):
-        pkg = render(cam, gaussians, pipe, bg, p11(F if K > 0 else 1.0), p11(K), select_view=0,
+    def render_img(cam, K, Kw, theta, Fc=None):
+        Fc = F if Fc is None else Fc
+        pkg = render(cam, gaussians, pipe, bg, p11(Fc if K > 0 else 1.0), p11(K), select_view=0,
                      tone_map=tone_map, band_limit=band_limit, kernel_size=kernel_size,
                      K_w=p11(Kw), slit_theta=p11(theta))
         return pkg["render"]
@@ -499,6 +549,7 @@ def main():
         torchvision.utils.save_image(img.clamp(0.0, 1.0), path)
 
     image_lines, slit_angles, test_names, used_cams = [], {}, [], set()
+    focus_groups = {}   # image name -> focus group (pose)
 
     def add_image(name, stem):
         e = extr_by_stem[stem]
@@ -516,17 +567,18 @@ def main():
                 # one layered rendering per pose for all distinct angles (disk copies share one image)
                 uniq = sorted(set(angles))
                 thetas = [math.radians(x + a.theta_bias_deg) for x in uniq]
-                imgs, info = psf_render.render_layered(cam, gaussians, render_aif_linear, F, thetas, kernel_fn,
+                imgs, info = psf_render.render_layered(cam, gaussians, render_aif_linear, focus_of[stem], thetas, kernel_fn,
                                                        a.n_layers, bg, tone_map=tone_map)
                 by_angle = dict(zip(uniq, imgs))
                 layer_blur_px.append(info["layer_step"] * K_L)
             for k, ang in enumerate(angles):
                 name = f"{stem}_a{k:02d}"
                 theta = math.radians(ang + a.theta_bias_deg)
-                img = by_angle[ang] if layered else render_img(cam, K_L, K_W, theta)
+                img = by_angle[ang] if layered else render_img(cam, K_L, K_W, theta, focus_of[stem])
                 save(img, os.path.join(img_dir, f"{name}.png"), noisy=True)
                 add_image(name, stem)
                 slit_angles[name] = ang  # nominal angle, without the simulated bias
+                focus_groups[name] = stem  # one focus setting per pose
         for cam in test_cams:
             stem = cam.image_name
             save(render_img(cam, 0.0, 0.0, 0.0), os.path.join(img_dir, f"{stem}.png"), noisy=False)
@@ -537,7 +589,8 @@ def main():
         print(f"Layered rendering: blur-length change across one layer {min(layer_blur_px):.2f}-"
               f"{max(layer_blur_px):.2f} px (long axis); increase --n_layers if this is well above 0.5 px")
 
-    write_defocus_maps(out, train_cams + test_cams, gaussians, pipe, F, K_L, band_limit, kernel_size)
+    write_defocus_maps(out, train_cams + test_cams, gaussians, pipe,
+                       lambda cam: focus_of.get(cam.image_name, F), K_L, band_limit, kernel_size)
 
     # ---- COLMAP model (text) ----
     with open(os.path.join(sp_dir, "cameras.txt"), "w") as f:
@@ -555,8 +608,11 @@ def main():
 
     with open(os.path.join(out, "slit_angles.json"), "w") as f:
         json.dump(slit_angles, f, indent=2)
+    with open(os.path.join(out, "focus_groups.json"), "w") as f:
+        json.dump(focus_groups, f, indent=2)
     with open(os.path.join(out, "split.json"), "w") as f:
         json.dump({"test": test_names}, f, indent=2)
+    # focus_distance: reference focus (defines the aperture size; per-pose values in focus_per_group)
     gt = dict(aperture=a.aperture, source_scene=a.scene, source_iteration=a.iteration, focus_distance=F,
               K_long=K_L, K_short=K_W, width_ratio=K_W / K_L, angles_deg=angles,
               theta_bias_deg=a.theta_bias_deg if a.aperture == "slit" else 0.0,
@@ -571,7 +627,12 @@ def main():
               aperture_area_K2=(K_L * K_W if a.aperture == "slit" else math.pi * K_L ** 2 / 4),
               aperture_area_px2_at_max_defocus=((K_L * K_W if a.aperture == "slit" else math.pi * K_L ** 2 / 4)
                                                 * d_max ** 2),
-              d_max=d_max, matched_area_of=a.match_area, ratio_is_optimal=(a.aperture == "slit" and a.optimal_ratio),
+              d_max=d_max, matched_area_of=a.match_area,
+              focus_mode=a.focus_mode, focus_range=list(a.focus_range),
+              focus_per_group=(focus_of if a.focus_mode == "per_pose" else None),
+              d_max_per_pose_max=(max(d_max_pose) if d_max_pose else d_max),
+              max_blur_px_per_pose_max=K_L * (max(d_max_pose) if d_max_pose else d_max),
+              ratio_is_optimal=(a.aperture == "slit" and a.optimal_ratio),
               theory=(theory_summary(K_W / K_L, angles) if a.aperture == "slit" else None),
               n_train_poses=len(train_cams), n_test_poses=len(test_cams))
     with open(os.path.join(out, "sim_gt.json"), "w") as f:
@@ -592,14 +653,18 @@ def main():
             new_conf.slit_ratio_lr = 0.0
         else:
             new_conf.slit_width_ratio = 0.2            # deliberately different from the ground truth
-        new_conf.slit_share_F = True
-        new_conf.slit_share_K = True
         new_conf.slit_learn_theta_offset = True
     else:
         new_conf.aperture_type = "disk"  # original DOF-GS model
         for k in [k for k in new_conf.keys() if str(k).startswith("slit_")]:
             new_conf.pop(k)
     new_conf.slit_group_by_pose = bool(a.group_by_pose)
+    # one focus distance per focus group (per pose) or for all images, one aperture scale
+    new_conf.share_F = "group" if a.focus_mode == "per_pose" else "global"
+    new_conf.share_K = "global"
+    for k in ("slit_share_F", "slit_share_K"):     # legacy flags would override share_F / share_K
+        if k in new_conf:
+            new_conf.pop(k)
     cfg_path = os.path.join("config_files", f"config_{new_scene}.yaml")
     OmegaConf.save(new_conf, cfg_path)
 
