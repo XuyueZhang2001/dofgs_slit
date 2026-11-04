@@ -4,7 +4,7 @@ Summarise the slit vs equal-area disk comparison over several source scenes
 
 For every source scene it reads the latest evaluation summary
 (<root>/<model_folder>/<scene>/eval_slit_recovery/iteration_*/summary.json) of
-    slit (densmax+L_dir)  <new_folder>/slitsim_<scene>_<design><suffix>   default slit_sim_dir0.03_densmax
+    slit (densmax+L_dir)  <new_folder>/slitsim_<scene>_<design><suffix>   default slit_sim_dir0.005_densmax
                           (max_angle densification + directional AiF loss)
     slit (orig)           <orig_folder>/slitsim_<scene>_<design><suffix>  default slit_sim (original model)
     disk                  <disk_folder>/disksim_<scene><suffix>           default slit_sim
@@ -60,7 +60,7 @@ def parse_args():
     p.add_argument("--suffix", default="_pf",
                    help="dataset-name suffix: _pf = per-pose focus (default), '' = earlier global-focus datasets")
     p.add_argument("--root", default="./output/model_dofgs")
-    p.add_argument("--new_folder", "--ours_folder", dest="new_folder", default="slit_sim_dir0.03_densmax",
+    p.add_argument("--new_folder", "--ours_folder", dest="new_folder", default="slit_sim_dir0.005_densmax",
                    help="model_folder of the slit model with max_angle densification + directional AiF loss")
     p.add_argument("--orig_folder", default="slit_sim", help="model_folder of the original slit model")
     p.add_argument("--disk_folder", default="slit_sim", help="model_folder of the disk model")

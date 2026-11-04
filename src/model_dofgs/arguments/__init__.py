@@ -140,7 +140,7 @@ class OptimizationParams(ParamGroup):
         # Directional all-in-focus loss for slit captures (src/utils/directional_loss.py):
         # compare the AiF render and the capture across the short slit axis after
         # smoothing both along the long axis. Only used for aperture_type 'slit'.
-        self.slit_dir_loss = 0.03           # weight (default 0.03, best together with max_angle); 0 disables it
+        self.slit_dir_loss = 0.005          # weight (default 0.005, with max_angle; see README); 0 disables it
         self.slit_dir_start_iter = -1       # -1: same as infocus_start_iter (never earlier)
         self.slit_dir_warmup = 2000         # linear ramp of the weight after the start
         self.slit_dir_sigma_w_max = 1.0     # short-axis blur std threshold (px) of the mask

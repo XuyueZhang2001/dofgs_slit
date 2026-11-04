@@ -10,7 +10,7 @@ errors are summarised by their mean absolute value and maximum.
 Usage (from the repository root):
     python tools/compare_slit_params.py \
         --sim ./data/slit_sim/slitsim_real_cake_n4_a0.40_pf \
-        --params ./output/model_dofgs/slit_sim_dir0.03_densmax/slitsim_real_cake_n4_a0.40_pf/defocus_params/iteration_40000/defocus_params.pth
+        --params ./output/model_dofgs/slit_sim_dir0.005_densmax/slitsim_real_cake_n4_a0.40_pf/defocus_params/iteration_40000/defocus_params.pth
 """
 import argparse
 import json

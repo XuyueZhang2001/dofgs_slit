@@ -40,9 +40,9 @@ Exposure (only matters with noise; see tools/simulate_slit_dataset.py)
 Directional AiF loss (slit only; src/utils/directional_loss.py)
   --dir_loss w [w ...]
                       weight(s) of the directional all-in-focus loss. Default: the
-                      default of OptimizationParams.slit_dir_loss (0.03). Every value is
+                      default of OptimizationParams.slit_dir_loss (0.005). Every value is
                       trained and evaluated on the same simulated dataset; a weight > 0
-                      adds the suffix _dir<w> to the model_folder (e.g. slit_sim_dir0.03).
+                      adds the suffix _dir<w> to the model_folder (e.g. slit_sim_dir0.005).
 
 Densification
   --densify_stat mean|max_angle

@@ -6,8 +6,8 @@
 #   reference   slitsim_<scene>: the original 20 x 2 px slit (area 40 px^2 at the largest
 #               defocus for the reference focus at the median inverse depth); it only
 #               provides the aperture area and the reference focus and is not trained
-#   slit (densmax+L_dir) n = 4, a = 0.4, max_angle densification + directional AiF loss 0.03
-#               (code defaults)   -> slit_sim_dir0.03_densmax/slitsim_<scene>_n4_a0.40<sfx>
+#   slit (densmax+L_dir) n = 4, a = 0.4, max_angle densification + directional AiF loss 0.005
+#               (code defaults)   -> slit_sim_dir0.005_densmax/slitsim_<scene>_n4_a0.40<sfx>
 #   slit (orig) same data, no directional loss, mean densification
 #                                 -> slit_sim/slitsim_<scene>_n4_a0.40<sfx>
 #   disk        equal-area disk, one capture per pose -> slit_sim/disksim_<scene><sfx>

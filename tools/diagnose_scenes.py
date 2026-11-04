@@ -56,7 +56,7 @@ def parse_args():
     p.add_argument("--suffix", default="_pf", help="dataset suffix (_pf = per-pose focus, '' = global focus)")
     p.add_argument("--data_root", default="./data/slit_sim")
     p.add_argument("--root", default="./output/model_dofgs")
-    p.add_argument("--new_folder", default="slit_sim_dir0.03_densmax")
+    p.add_argument("--new_folder", default="slit_sim_dir0.005_densmax")
     p.add_argument("--orig_folder", default="slit_sim")
     p.add_argument("--disk_folder", default="slit_sim")
     p.add_argument("--blur_thresh", type=float, default=4.0,
