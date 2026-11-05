@@ -25,6 +25,17 @@ from src.utils.focus_utils import param_index, slot_means
 DISK_APERTURE_COEFF = 0.36067376022224085
 SLIT_APERTURE_COEFF = 1.0 / 3.0
 
+# Energy-conserving defocus (rasterizer option coc_energy, see set_coc_energy).
+ALPHA_MIN_DEFAULT = 1.0 / 255.0     # 3DGS threshold of splat-pixel pairs
+ALPHA_MIN_ENERGY = 1e-4             # default with coc_energy > 0 (faint defocused splats)
+
+
+def resolve_coc_alpha_min(coc_energy, alpha_min=-1.0):
+    """alpha_min < 0 (auto): 1/255 for coc_energy = 0, ALPHA_MIN_ENERGY otherwise."""
+    if alpha_min is not None and float(alpha_min) > 0:
+        return float(alpha_min)
+    return ALPHA_MIN_ENERGY if float(coc_energy) > 0 else ALPHA_MIN_DEFAULT
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -78,6 +89,10 @@ class GaussianModel:
         # rotatable rectangular aperture (see setup_defocus_params).
         self.aperture_type = 'disk'
         self.aperture_coeff = DISK_APERTURE_COEFF
+        # Energy-conserving defocus: 0 = original DOF-GS (peak opacity kept),
+        # 1 = integrated opacity of every splat conserved (see set_coc_energy).
+        self.coc_energy = 0.0
+        self.coc_alpha_min = ALPHA_MIN_DEFAULT
         self.n_view = 1
         self.slit_share_F = False
         self.slit_share_K = False
@@ -442,12 +457,30 @@ class GaussianModel:
         if self.f_index.device != self.Fs.device:
             self.f_index, self.k_index = self.f_index.to(self.Fs.device), self.k_index.to(self.Fs.device)
 
+    def set_coc_energy(self, coc_energy=0.0, alpha_min=-1.0):
+        """
+        Energy-conserving defocus in the rasterizer. A defocused splat is enlarged by
+        the CoC covariance dSigma; its opacity is multiplied by
+            (det(Sigma0) / det(Sigma0 + dSigma))^(coc_energy / 2),
+        Sigma0 being the projected covariance. coc_energy = 0 is the original DOF-GS
+        (peak opacity kept), 1 conserves the splat's integrated opacity (a convolution
+        with the defocus PSF), values in between interpolate. In-focus renders are
+        unchanged. alpha_min: threshold of splat-pixel pairs (< 0: automatic).
+        """
+        coc_energy = float(coc_energy)
+        if not 0.0 <= coc_energy <= 1.0:
+            raise ValueError(f"coc_energy must be in [0, 1], got {coc_energy}")
+        self.coc_energy = coc_energy
+        self.coc_alpha_min = resolve_coc_alpha_min(coc_energy, alpha_min)
+
     def aperture_state_dict(self):
         def cpu(t):
             return None if t is None else t.detach().cpu()
         return {
             'aperture_type': self.aperture_type,
             'aperture_coeff': self.aperture_coeff,
+            'coc_energy': getattr(self, 'coc_energy', 0.0),
+            'coc_alpha_min': getattr(self, 'coc_alpha_min', ALPHA_MIN_DEFAULT),
             'n_view': self.n_view,
             'share_F': self.slit_share_F,
             'share_K': self.slit_share_K,
@@ -466,6 +499,9 @@ class GaussianModel:
     def load_aperture_state_dict(self, state):
         self.aperture_type = state['aperture_type']
         self.aperture_coeff = state['aperture_coeff']
+        # models saved before the energy-conserving option: original rendering
+        self.coc_energy = float(state.get('coc_energy', 0.0))
+        self.coc_alpha_min = float(state.get('coc_alpha_min', ALPHA_MIN_DEFAULT))
         self.n_view = state['n_view']
         self.slit_share_F = state['share_F']
         self.slit_share_K = state['share_K']

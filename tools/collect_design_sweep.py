@@ -89,6 +89,8 @@ def load_rows(a):
             images_per_pose=design["images_per_pose"],
             train_mode="per_pose" if design.get("group_by_pose") else "per_view",
             dir_loss=dir_loss,
+            # energy-conserving defocus of the trained model (runs before the option: 0)
+            coc_energy=float(cfg.get("coc_energy", 0.0) or 0.0),
             psf=psf_label(gt),
             noise=gt.get("noise_std", 0.0),
             # datasets simulated before exposure control used exposure 1 for every capture
@@ -125,6 +127,8 @@ def psf_label(gt):
 def same_capture_budget(d, r):
     """True if disk run d is a fair reference for run r (same PSF model, noise setting and total exposure)."""
     if d["psf"] != r["psf"]:
+        return False
+    if d.get("coc_energy", 0.0) != r.get("coc_energy", 0.0):   # same defocus rendering in training
         return False
     if d["noise"] != r["noise"]:
         return False
@@ -171,7 +175,7 @@ def write_table(rows, out_dir):
     for r in rows:
         r["captures"] = f"{r['images_per_pose']} x {r['exposure']:.4g}"
     cols = [("run", None), ("aperture", "aperture"), ("n", "n"), ("a", "a"), ("train mode", "train_mode"),
-            ("λ_dir", "dir_loss"), ("PSF", "psf"), ("iter", "iteration"), ("noise σ", "noise"), ("captures/pose x exposure", "captures"),
+            ("λ_dir", "dir_loss"), ("coc_energy", "coc_energy"), ("PSF", "psf"), ("iter", "iteration"), ("noise σ", "noise"), ("captures/pose x exposure", "captures"),
             ("total exposure", "total_exposure"), ("σ_eff", "noise_eff"), ("test PSNR", "test_psnr"), ("test SSIM", "test_ssim"),
             ("test LPIPS", "test_lpips"), ("gain over input (dB)", "gain_over_input"),
             ("Δ PSNR vs disk (dB)", "delta_test_psnr_vs_disk"), ("theory DOF gain", "theory_dof_gain"),

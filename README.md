@@ -28,7 +28,7 @@ r_W    = 0.5 * K_W * d                    half-length along the slit short axis 
 
 | Part | Change |
 |---|---|
-| `submodules/diff-gaussian-rasterization-dof/` | The forward pass adds the rotated slit covariance, including the off-diagonal term. The backward pass gives analytic gradients w.r.t. `K_L`, `K_W`, θ, `F` and depth. The new inputs (`Kw`, `theta`, `aperture_coeff`) are passed through the C++/Python bindings. In debug mode, kernel launch errors are reported. |
+| `submodules/diff-gaussian-rasterization-dof/` | The forward pass adds the rotated slit covariance, including the off-diagonal term. The backward pass gives analytic gradients w.r.t. `K_L`, `K_W`, θ, `F` and depth. The new inputs (`Kw`, `theta`, `aperture_coeff`) are passed through the C++/Python bindings. Optional energy-conserving CoC (`coc_energy`, `alpha_min`; see [Energy-conserving CoC](#energy-conserving-coc-rasterizer-option)). In debug mode, kernel launch errors are reported. |
 | `src/model_dofgs/gaussian_model.py` | Slit parameters: `F` and `K_L` (shared or per view), a short/long ratio `K_W / K_L` in (0, 1), the known per-view angles, and an optional global angle offset. All of these are saved in checkpoints. |
 | `src/model_dofgs/renderer/__init__.py` | Passes `K_w` and `slit_theta` to the rasterizer, so any slit angle can be rendered. |
 | `src/model_dofgs/training.py`, `arguments/` | Loads the slit angles and adds the slit configuration options. Adds the directional all-in-focus loss for slit captures (see [Directional all-in-focus loss](#directional-all-in-focus-loss-slit)). |
@@ -202,6 +202,7 @@ The script also writes `config_files/config_slitsim_real_cake.yaml` and register
 | `--full_circle` | spread the angles over 360° instead of 180° |
 | `--psf` | PSF model of the captures: `gaussian` (default, **recommended**: the rasterizer's model), `gaussian_layered` or `box` (experimental, see [Realistic PSF simulation](#realistic-psf-simulation-layered)) |
 | `--defocus_only` | only (re)write `defocus/*.npy` for an existing simulated dataset |
+| `--coc_energy` | energy-conserving CoC of the rasterizer for `--psf gaussian` captures, in [0, 1] (default 0); > 0 adds `_ec<value>` and is written to the training config (see [Energy-conserving CoC](#energy-conserving-coc-rasterizer-option)) |
 
 `K` is parametrised as `K = clamp(Ks, 0.01, 200) * 100 + 100`, so `K_L < 101` cannot be represented. The script warns when the requested blur is too small.
 
@@ -644,14 +645,73 @@ With the default `--psf gaussian`, the slit reaches 31.98 dB (+2.8 dB over its i
 - **Use the default `--psf gaussian`** for aperture-design studies (n, a, noise, exposure). Results then compare slit and disk *within the DOF-GS blur model*. They test the optimisation and the aperture design, but not physical accuracy. State this when reporting them.
 - Keep `gaussian_layered` / `box` for model-mismatch studies.
 - For real slit data, share `F` per focus group (`share_F: group`, the default) rather than globally. Per-image optics (`share_F: view`, `share_K: view`) give the slit the same freedom to compensate as the original DOF-GS.
-- A physically consistent fix would scale each splat's opacity by `sqrt(det Σ / det(Σ + ΔΣ))` (energy-conserving CoC). This is not implemented.
+- A physically consistent fix scales each splat's opacity by `sqrt(det Σ / det(Σ + ΔΣ))` (energy-conserving CoC). It is available as the option `coc_energy`; see [Energy-conserving CoC](#energy-conserving-coc-rasterizer-option).
+
+---
+
+## Energy-conserving CoC (rasterizer option)
+
+The rasterizer blurs a defocused splat by adding the CoC covariance `ΔΣ` to its projected covariance `Σ₀`, but keeps its peak opacity (see [Results and recommendation](#results-and-recommendation-1) under the layered simulation). The splat then carries more energy (opacity × area) than in focus. A convolution of the splat with the normalised PSF would instead lower the peak by `sqrt(det Σ₀ / det(Σ₀ + ΔΣ))`, as Mip-Splatting does for its 2D filter. The option `coc_energy = λ ∈ [0, 1]` multiplies the opacity of every splat by
+
+```
+g = ( det Σ₀ / det(Σ₀ + ΔΣ) )^(λ/2)
+```
+
+| λ | behaviour |
+|---|---|
+| 0 (default) | original DOF-GS: peak opacity kept; bit-identical to the earlier rasterizer |
+| 1 | integrated opacity of every splat conserved (convolution with the Gaussian PSF) |
+| between | interpolation, for studies or as a compromise |
+
+- **In focus nothing changes:** `ΔΣ = 0` gives `g = 1`, so all-in-focus renders, test views and existing checkpoints are not affected.
+- **Gradients:** the backward pass includes the gradient of `g`. The `det Σ₀` term reaches only the Gaussian's covariance (scales, rotation, position); the `det(Σ₀ + ΔΣ)` term also reaches `F`, `K_L`, `K_W`, θ and the depth.
+- **Alpha threshold:** splat–pixel pairs with alpha below a threshold are skipped (1/255 in 3DGS). A small splat blurred over many pixels becomes fainter than that, and its energy would be lost. `coc_alpha_min` (default `-1`, automatic) uses 1/255 for λ = 0 and `1e-4` for λ > 0. A lower threshold renders somewhat more slowly.
+- **Not an exact convolution:** each splat is blurred on its own and then alpha-composited. Overlapping faint splats combine as `1 − ∏(1 − αᵢ)`, which is less than the sum of their alphas, so a blurred opaque surface made of a single layer of splats can look slightly transparent. Occlusion boundaries are approximated as before.
+
+**Options.**
+
+| Where | Option | Meaning |
+|---|---|---|
+| `ModelParams` (config) | `coc_energy` (0.0), `coc_alpha_min` (-1 = auto) | used for training and saved with the defocus parameters, so evaluation and rendering of the model use the same value |
+| `simulate_slit_dataset.py` | `--coc_energy λ` | Gaussian-PSF captures rendered with λ, scene suffix `_ec<λ>`; layered PSFs ignore it for the captures |
+| `run_design_sweep.py` | `--coc_energy λ` | training of slit and disk with λ (model folder suffix `_ec<λ>`) and, with `--psf gaussian`, simulation as well |
+| `GaussianRasterizationSettings` | `coc_energy`, `alpha_min` | low-level rasterizer settings (defaults 0, 1/255) |
+
+`list_runs.py` and `collect_design_sweep.py` show the value in the `ec` / `coc_energy` column, and each slit run is compared only with a disk of the same value.
+
+**Rebuild the rasterizer** after updating the code (see [Installation](#installation)):
+
+```shell
+pip uninstall -y diff_dof_gs_rasterizer
+rm -rf submodules/diff-gaussian-rasterization-dof/build
+export TORCH_CUDA_ARCH_LIST="8.0"          # your GPU
+pip install --no-build-isolation submodules/diff-gaussian-rasterization-dof
+python tests/test_slit_rasterizer.py       # checks 1-3 as before, 4a-4d for coc_energy
+```
+
+**Validation.**
+
+```shell
+# 1. forward only: splat defocus vs the layered (physically convolved) captures
+python tools/check_coc_energy.py \
+    --sim ./data/slit_sim/slitsim_real_cake_n4_a0.40_glayer ./data/slit_sim/disksim_real_cake_glayer \
+    --coc_energy 0 0.5 1 --save_images 3
+# 2. training on the layered datasets with the energy-conserving model (folder slit_sim_..._ec1)
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --psf gaussian_layered --focus_mode global --coc_energy 1
+# 3. consistent Gaussian simulation and training with lambda = 1 (datasets _pf_ec1)
+python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
+    --scene real_cake --iteration 15000 --gpu 1 --coc_energy 1
+```
+
+Step 1 needs no training: if λ = 1 renders are much closer to the layered captures than λ = 0, the option removes most of the model error. Step 2 is the decisive test: with λ = 0 the recovered all-in-focus image of the layered data was worse than the inputs (slit 29.23 dB vs 32.85 dB input, disk 33.62 vs 34.18). The `--focus_mode global` in step 2 matches the existing `_glayer` datasets, which were simulated before the per-pose focus. Their disk config has no sharing keys, so the current code trains it with one `K` (`share_K: global`), while the earlier λ = 0 disk run learned `F` and `K` per image. For a like-for-like control, train λ = 0 again with the current code (move the earlier `slit_sim/disksim_real_cake_glayer` and `slit_sim/slitsim_real_cake_n4_a0.40_glayer` outputs aside first). Results are not yet available.
 
 ---
 
 ## Notes and limitations
 
 - **Gaussian PSF approximation.** The reconstruction approximates the rectangular PSF by an anisotropic Gaussian with matched variance. Sharp edges, sinc zeros of the OTF, diffraction from a narrow slit, and partial occlusion at depth boundaries are not modelled. The default and recommended simulation (`--psf gaussian`) uses the same approximation, so it tests the optimisation (identifiability, convergence) and the aperture design, not model mismatch. Use `--psf gaussian_layered` / `box` (optionally with `--diffraction`) to test model mismatch; see [Realistic PSF simulation](#realistic-psf-simulation-layered).
-- **Splat blur is not a convolution.** Like the original DOF-GS, the rasterizer enlarges each splat by the CoC but keeps its peak opacity, so its defocus does not conserve energy. On physically blurred (layered) data, the recovered all-in-focus image is worse than the inputs. See [Results and recommendation](#results-and-recommendation-1) under the layered simulation.
+- **Splat blur is not a convolution.** Like the original DOF-GS, the rasterizer enlarges each splat by the CoC but keeps its peak opacity by default, so its defocus does not conserve energy. On physically blurred (layered) data, the recovered all-in-focus image is worse than the inputs. See [Results and recommendation](#results-and-recommendation-1) under the layered simulation. The option `coc_energy` makes the splat blur energy-conserving; see [Energy-conserving CoC](#energy-conserving-coc-rasterizer-option).
 - **Width identifiability.** The slit covariance splits into `s_W·I + (s_L − s_W)·uuᵀ`. The rotating rank-1 term constrains `F`, `K_L` and θ well. The isotropic term `s_W·I` is the same in every orientation and can be absorbed by slightly larger Gaussians, so a learned width ratio may collapse towards 0, especially when the short-axis blur is only a few pixels. When the slit geometry is known, fix the ratio with `slit_ratio_lr: 0`.
 - **Simulated vs. paper metrics.** Simulated datasets use DOF-GS renders as ground truth. Absolute PSNR/SSIM values are therefore not comparable to the numbers in the DOF-GS paper; compare configurations on the same simulated data instead.
 - The random seed is fixed in `src/model_dofgs/training.py` (`3467`). Use several seeds before drawing conclusions from small metric differences.
@@ -673,8 +733,9 @@ tools/
   summarize_scenes.py        per-scene and mean results of that comparison
   diagnose_scenes.py         per-scene statistics (blur, image detail) vs the slit gain
   psf_render.py              layered rendering with box / disk / Gaussian PSFs and diffraction
+  check_coc_energy.py        forward-only check of the energy-conserving CoC against simulated captures
 tests/
-  test_slit_rasterizer.py    rasterizer smoke test (regression, anisotropy, gradients)
+  test_slit_rasterizer.py    rasterizer smoke test (regression, anisotropy, gradients, energy-conserving CoC)
   test_directional_loss.py   CPU checks of the directional all-in-focus loss
   test_psf_render.py         CPU checks of the PSF kernels and layered compositing
   test_focus_groups.py       CPU checks of focus groups, F / K sharing and per-pose focus

@@ -9,6 +9,13 @@ Checks
   2. Anisotropy: a defocused Gaussian is elongated along x at theta = 0 and
      along y at theta = 90 deg.
   3. Gradients: analytic gradients w.r.t. K, Kw, theta, F match finite differences.
+  4. Energy-conserving CoC (coc_energy):
+     a. coc_energy = 0 reproduces the default rendering;
+     b. coc_energy = 1 keeps the integrated opacity of a defocused Gaussian
+        independent of K and of the slit angle (0 lets it grow with K);
+     c. in focus, coc_energy has no effect;
+     d. gradients w.r.t. F, K, Kw, theta, opacities and scales match finite
+        differences for coc_energy = 1 and 0.5.
 """
 import math
 import os
@@ -50,7 +57,8 @@ def make_scene(n, seed=0):
     )
 
 
-def render(scene, F, K, Kw=None, theta=None, coeff=SLIT_COEFF):
+def render(scene, F, K, Kw=None, theta=None, coeff=SLIT_COEFF, coc_energy=0.0, alpha_min=1.0 / 255.0,
+           opacities=None, scales=None):
     view = torch.eye(4, device=dev)
     proj = projection_matrix(0.01, 100.0, FOV, FOV).T.to(dev)
     settings = GaussianRasterizationSettings(
@@ -62,11 +70,13 @@ def render(scene, F, K, Kw=None, theta=None, coeff=SLIT_COEFF):
         viewmatrix=view, projmatrix=view @ proj,
         sh_degree=0, campos=torch.zeros(3, device=dev),
         prefiltered=False, debug=DEBUG, vIdx=0, coc2z_coeff=0.0,
-        aperture_coeff=coeff)
+        aperture_coeff=coeff, coc_energy=coc_energy, alpha_min=alpha_min)
     means2D = torch.zeros_like(scene["means3D"], requires_grad=True)
     out = GaussianRasterizer(settings)(
-        means3D=scene["means3D"], means2D=means2D, opacities=scene["opacities"],
-        colors_precomp=scene["colors"], scales=scene["scales"], rotations=scene["rotations"],
+        means3D=scene["means3D"], means2D=means2D,
+        opacities=scene["opacities"] if opacities is None else opacities,
+        colors_precomp=scene["colors"], scales=scene["scales"] if scales is None else scales,
+        rotations=scene["rotations"],
         F=F, K=K, Kw=Kw, theta=theta)
     return out[0]
 
@@ -134,3 +144,96 @@ for k in base:
     print(f"   d/d{k:5s}: analytic={ana: .5e}  numeric={num: .5e}  rel.err={rel:.3f}  {flag}")
 assert ok, "gradient mismatch (see above)"
 print("3. gradients (K, Kw, theta, F): OK")
+
+
+
+# 4. Energy-conserving CoC.
+# a. coc_energy = 0 is the default path.
+scene = make_scene(200, seed=3)
+ref = render(scene, p(3.0), p(60.0), Kw=p(15.0), theta=p(0.4))
+img = render(scene, p(3.0), p(60.0), Kw=p(15.0), theta=p(0.4), coc_energy=0.0)
+assert torch.equal(img, ref), "coc_energy = 0 differs from the default rendering"
+print("4a. coc_energy = 0 reproduces the default rendering: OK")
+
+# b. Integrated opacity of one defocused Gaussian (white, black background, peak
+#    opacity below the 0.99 clamp, tiny alpha threshold so that nothing is cut).
+one = make_scene(1)
+one["means3D"] = torch.tensor([[0.0, 0.0, 5.0]], device=dev)
+one["colors"] = torch.ones(1, 3, device=dev)
+one["opacities"] = torch.full((1, 1), 0.5, device=dev)
+one["scales"] = torch.full((1, 3), 0.03, device=dev)
+
+
+def energy(K, Kw, theta, lam):
+    return render(one, p(2.0), p(K), Kw=p(Kw), theta=p(theta), coc_energy=lam, alpha_min=1e-7)[0].sum().item()
+
+
+e_focus = render(one, p(5.0), p(100.0), Kw=p(40.0), alpha_min=1e-7)[0].sum().item()   # F = z: in focus
+rows = []
+# PSF up to ~16 px std along the long axis, so that the splat stays inside the image
+for K, Kw, th in [(60.0, 24.0, 0.0), (120.0, 48.0, 0.0), (180.0, 72.0, 0.0), (180.0, 72.0, 1.0)]:
+    rows.append((K, Kw, th, energy(K, Kw, th, 0.0), energy(K, Kw, th, 1.0)))
+    print(f"   K={K:5.0f} Kw={Kw:5.0f} theta={th:.1f}: energy coc_energy=0 {rows[-1][3]:8.2f}   "
+          f"coc_energy=1 {rows[-1][4]:8.2f}   (in focus {e_focus:.2f})")
+e1 = [r[4] for r in rows]
+assert max(e1) / min(e1) < 1.05, "coc_energy = 1 does not conserve the integrated opacity"
+assert abs(e1[0] / e_focus - 1.0) < 0.05, "coc_energy = 1 changes the integrated opacity of the splat"
+assert rows[2][3] > 2.0 * rows[0][3], "coc_energy = 0 should let the energy grow with K"
+print("4b. coc_energy = 1 conserves the integrated opacity: OK")
+
+# c. In focus (F = z), coc_energy has no effect.
+a0 = render(one, p(5.0), p(200.0), Kw=p(80.0), coc_energy=0.0, alpha_min=1e-4)
+a1 = render(one, p(5.0), p(200.0), Kw=p(80.0), coc_energy=1.0, alpha_min=1e-4)
+assert torch.allclose(a0, a1, atol=1e-6), "coc_energy changes an in-focus rendering"
+print("4c. in focus, coc_energy has no effect: OK")
+
+# d. Gradients with the energy-conserving CoC (directional derivatives for the
+#    per-Gaussian opacities and scales). The loss is quadratic in the image: with
+#    coc_energy = 1 the integrated opacity no longer depends on F / K / Kw / theta,
+#    so a loss linear in the image changes only by redistribution, and its small
+#    derivative is swamped by the finite-difference noise of the alpha threshold
+#    and the tile cut-off. A quadratic loss (like the training losses) depends on
+#    the blur directly.
+scene = make_scene(150, seed=4)
+scene["opacities"] = torch.rand(150, 1, device=dev, generator=torch.Generator(dev).manual_seed(5)) * 0.8 + 0.1
+wgt = torch.rand(3, H, W, device=dev, generator=torch.Generator(dev).manual_seed(6))
+for lam in (1.0, 0.5):
+    def loss_e(vals, opac, scl, grad=False):
+        t = {k: p(v, grad) for k, v in vals.items()}
+        img = render(scene, t["F"], t["K"], Kw=t["Kw"], theta=t["theta"], coc_energy=lam, alpha_min=1e-4,
+                     opacities=opac, scales=scl)
+        return (wgt * img ** 2).sum(), t
+
+    opac = scene["opacities"].clone().requires_grad_(True)
+    scl = scene["scales"].clone().requires_grad_(True)
+    L, t = loss_e(base, opac, scl, grad=True)
+    L.backward()
+    ok = True
+    for k in base:
+        up, dn = dict(base), dict(base)
+        up[k] += eps[k]
+        dn[k] -= eps[k]
+        with torch.no_grad():
+            num = (loss_e(up, scene["opacities"], scene["scales"])[0]
+                   - loss_e(dn, scene["opacities"], scene["scales"])[0]).item() / (2 * eps[k])
+        ana = t[k].grad.item()
+        rel = abs(ana - num) / (abs(num) + 1e-3)
+        ok &= rel < 0.05
+        print(f"   lambda={lam:g} d/d{k:5s}: analytic={ana: .5e}  numeric={num: .5e}  rel.err={rel:.3f}  "
+              f"{'ok' if rel < 0.05 else 'MISMATCH'}")
+    g = torch.Generator(dev).manual_seed(7)
+    for name, x, gx, h in (("opacity", scene["opacities"], opac.grad, 1e-3),
+                           ("scales", scene["scales"], scl.grad, 2e-4)):
+        v = torch.randn(x.shape, device=dev, generator=g)
+        with torch.no_grad():
+            if name == "opacity":
+                num = (loss_e(base, x + h * v, scene["scales"])[0] - loss_e(base, x - h * v, scene["scales"])[0]).item() / (2 * h)
+            else:
+                num = (loss_e(base, scene["opacities"], x + h * v)[0] - loss_e(base, scene["opacities"], x - h * v)[0]).item() / (2 * h)
+        ana = (gx * v).sum().item()
+        rel = abs(ana - num) / (abs(num) + 1e-3)
+        ok &= rel < 0.05
+        print(f"   lambda={lam:g} d/d{name:7s} (random direction): analytic={ana: .5e}  numeric={num: .5e}  "
+              f"rel.err={rel:.3f}  {'ok' if rel < 0.05 else 'MISMATCH'}")
+    assert ok, f"gradient mismatch with coc_energy = {lam:g} (see above)"
+print("4d. gradients with the energy-conserving CoC: OK")

@@ -85,6 +85,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             Kw,
             theta,
             raster_settings.aperture_coeff,
+            raster_settings.coc_energy,
+            raster_settings.alpha_min,
             raster_settings.vIdx,
             raster_settings.tanfovx,
             raster_settings.tanfovy,
@@ -137,6 +139,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.projmatrix, 
                 F, K, Kw, theta,
                 raster_settings.aperture_coeff,
+                raster_settings.coc_energy,
+                raster_settings.alpha_min,
                 raster_settings.coc2z_coeff,
                 raster_settings.vIdx,
                 raster_settings.tanfovx, 
@@ -205,6 +209,14 @@ class GaussianRasterizationSettings(NamedTuple):
     # Variance coefficient of the defocus PSF. 1/(2 ln 4) is the original
     # DOF-GS (circular aperture) value; 1/3 matches a uniform box (slit).
     aperture_coeff: float = 0.36067376022224085
+    # Energy-conserving defocus: the opacity of a defocused splat is multiplied by
+    # (det(Sigma0) / det(Sigma0 + dSigma_CoC))^(coc_energy / 2). 0 keeps the peak
+    # opacity (original DOF-GS); 1 conserves the splat's integrated opacity, as a
+    # convolution with the defocus PSF would.
+    coc_energy: float = 0.0
+    # Splat-pixel pairs with alpha below this are skipped (1/255 in 3DGS). Use a
+    # lower value with coc_energy > 0, whose defocused splats are faint.
+    alpha_min: float = 1.0 / 255.0
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):

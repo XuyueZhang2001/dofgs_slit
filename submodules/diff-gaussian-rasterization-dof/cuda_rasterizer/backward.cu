@@ -157,6 +157,7 @@ __global__ void computeCov2DCUDA(int P,
 	const float* Kw,
 	const float* theta,
 	const float aperture_coeff,
+	const float coc_energy,
 	const float coc2z_coeff,
 	const int vIdx,
 	const float* dL_dconics,
@@ -213,6 +214,11 @@ __global__ void computeCov2DCUDA(int P,
 	glm::mat3 cov2D = glm::transpose(T) * glm::transpose(Vrk) * T;
 
 
+	// Projected covariance before defocus (no Mip filter): reference of the
+	// energy-conserving CoC.
+	const float a0 = cov2D[0][0], b0 = cov2D[0][1], c0 = cov2D[1][1];
+	const float det_sigma0 = a0 * c0 - b0 * b0;
+
 	// Re-compute the slit-aperture defocus covariance exactly as in the forward pass.
 	const SlitCoC coc = computeSlitCoC(t.z, F[vIdx], K[vIdx], Kw[vIdx], theta[vIdx], aperture_coeff);
 	cov2D[0][0] += coc.da;
@@ -232,8 +238,16 @@ __global__ void computeCov2DCUDA(int P,
 	// we need opacity as input
 	// new_opacity = coef * opacity
 	// if we know the new opacity, we can derive original opacity and then dalpha_dcoef = dopacity * opacity
-	const float opacity = combined_opacity / (coef + 1e-6);
-	const float dL_dcoef = dL_dopacity[idx] * opacity;
+	// Energy-conserving CoC: combined opacity = opacity * coef * g, with
+	// g = (det(Sigma0) / det(Sigma0 + dSigma))^(coc_energy / 2) (1 for coc_energy = 0).
+	bool energy_active = false;
+	const float g_energy = (coc_energy > 0.0f) ? cocEnergyFactor(det_sigma0, det_0, coc_energy, energy_active) : 1.0f;
+	const float coef_total = coef * g_energy;
+	const float opacity = (coc_energy > 0.0f)
+		? (coef_total > 1e-12f ? combined_opacity / coef_total : 0.0f)
+		: combined_opacity / (coef + 1e-6);
+	// dL / dcoef of the Mip-filter coefficient (g fixed)
+	const float dL_dcoef = dL_dopacity[idx] * opacity * g_energy;
 	const float dL_dsqrtcoef = dL_dcoef * 0.5 * 1. / (coef + 1e-6);
 	const float dL_ddet0 = dL_dsqrtcoef / (det_1+1e-6);
 	const float dL_ddet1 = dL_dsqrtcoef * det_0 * (-1.f / (det_1 * det_1 + 1e-6));
@@ -241,6 +255,27 @@ __global__ void computeCov2DCUDA(int P,
 	const float dcoef_da = dL_ddet0 * cov2D[1][1] + dL_ddet1 * (cov2D[1][1] + kernel_size);
 	const float dcoef_db = dL_ddet0 * (-2. * cov2D[0][1]) + dL_ddet1 * (-2. * cov2D[0][1]);
 	const float dcoef_dc = dL_ddet0 * cov2D[0][0] + dL_ddet1 * (cov2D[0][0] + kernel_size);
+
+	// Gradient of g: log g = (coc_energy / 2) (log det(Sigma0) - log det(Sigma0 + dSigma)).
+	// The det(Sigma0 + dSigma) term depends on the projected covariance and on the
+	// defocus parameters (added to dcoef_* below); the det(Sigma0) term only on the
+	// projected covariance (added after the defocus-parameter gradients).
+	float dE_da = 0.f, dE_db = 0.f, dE_dc = 0.f;     // via det(Sigma0 + dSigma)
+	float dE0_da = 0.f, dE0_db = 0.f, dE0_dc = 0.f;  // via det(Sigma0)
+	if (energy_active)
+	{
+		// dL / dlog g = dL/d(combined opacity) * opacity * coef * g
+		const float dL_dlogg = dL_dopacity[idx] * opacity * coef_total;
+		const float wE = 0.5f * coc_energy * dL_dlogg;
+		const float kB = -wE / det_0;
+		dE_da = kB * cov2D[1][1];
+		dE_db = kB * (-2.f * cov2D[0][1]);
+		dE_dc = kB * cov2D[0][0];
+		const float k0 = wE / det_sigma0;
+		dE0_da = k0 * c0;
+		dE0_db = k0 * (-2.f * b0);
+		dE0_dc = k0 * a0;
+	}
 	
 	// Use helper variables for 2D covariance entries. More compact.
 	float a = cov2D[0][0] += kernel_size;
@@ -266,12 +301,12 @@ __global__ void computeCov2DCUDA(int P,
 			dL_dopacity[idx] = 0;
 		} else {
 			// Gradiends of alpha respect to conv due to low pass filter
-			dL_da += dcoef_da;
-			dL_dc += dcoef_dc;
-			dL_db += dcoef_db;
+			dL_da += dcoef_da + dE_da;
+			dL_dc += dcoef_dc + dE_dc;
+			dL_db += dcoef_db + dE_db;
 
 			// update dL_dopacity
-			dL_dopacity[idx] = dL_dopacity[idx] * coef;
+			dL_dopacity[idx] = dL_dopacity[idx] * ((coc_energy > 0.0f) ? coef_total : coef);
 		}
 
 		// Gradients w.r.t. the slit aperture parameters.
@@ -302,6 +337,14 @@ __global__ void computeCov2DCUDA(int P,
 		atomicAdd(&(dL_dK[vIdx]), grad_K);
 		atomicAdd(&(dL_dKw[vIdx]), grad_Kw);
 		atomicAdd(&(dL_dtheta[vIdx]), grad_theta);
+
+		// Energy-conserving CoC: det(Sigma0) term, w.r.t. the projected covariance only.
+		if (!(det_0 <= 1e-6 || det_1 <= 1e-6))
+		{
+			dL_da += dE0_da;
+			dL_db += dE0_db;
+			dL_dc += dE0_dc;
+		}
 
 		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry, 
 		// given gradients w.r.t. 2D covariance matrix (diagonal).
@@ -530,7 +573,8 @@ renderCUDA(
 	float3* __restrict__ dL_dmean3D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	const float alpha_min)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -635,7 +679,7 @@ renderCUDA(
 
 			const float G = exp(power);
 			const float alpha = min(0.99f, con_o.w * G);
-			if (alpha < 1.0f / 255.0f)
+			if (alpha < alpha_min)   // same threshold as the forward pass
 				continue;
 
 			T = T / (1.f - alpha);
@@ -756,6 +800,7 @@ void BACKWARD::preprocess(
 	const float* Kw,
 	const float* theta,
 	const float aperture_coeff,
+	const float coc_energy,
 	const float coc2z_coeff,
 	const int vIdx,
 	const float focal_x, float focal_y,
@@ -792,7 +837,7 @@ void BACKWARD::preprocess(
 		tan_fovy,
 		kernel_size,
 		viewmatrix,
-		F, K, Kw, theta, aperture_coeff, coc2z_coeff, vIdx,
+		F, K, Kw, theta, aperture_coeff, coc_energy, coc2z_coeff, vIdx,
 		dL_dconic,
 		dL_dK,
 		dL_dF,
@@ -850,7 +895,8 @@ void BACKWARD::render(
 	float3* dL_dmean3D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	const float alpha_min)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -875,6 +921,7 @@ void BACKWARD::render(
 		dL_dmean3D,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		alpha_min
 		);
 }

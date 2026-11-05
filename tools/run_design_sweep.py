@@ -83,6 +83,19 @@ PSF model (see tools/simulate_slit_dataset.py and tools/psf_render.py)
   Training always uses the Gaussian model of the rasterizer, so box / diffraction
   datasets test the reconstruction under model mismatch.
 
+Energy-conserving defocus (rasterizer)
+  --coc_energy lambda
+                      in [0, 1]; the opacity of a defocused splat is multiplied by
+                      (det S0 / det(S0 + dS_CoC))^(lambda / 2). 0 (default) is the
+                      original DOF-GS (peak opacity kept), 1 conserves the integrated
+                      opacity of every splat (a convolution with the PSF). Used for
+                      training (slit and disk, model_folder suffix _ec<lambda>) and,
+                      with --psf gaussian, for the simulated captures as well (scene
+                      suffix _ec<lambda>). Layered datasets (--psf gaussian_layered /
+                      box) are physical convolutions and are reused unchanged, e.g.
+                      --psf gaussian_layered --coc_energy 1 trains the existing
+                      _glayer datasets with the energy-conserving model.
+
 Usage (from the repository root, e.g. inside tmux):
     python tools/run_design_sweep.py --config ./config_files/config_real_cake.yaml \
         --scene real_cake --iteration 15000 --gpu 1                    # default design 4:0.4 + disk
@@ -162,6 +175,9 @@ def parse_args():
                         "slit and disk always use the same model")
     p.add_argument("--diffraction", action="store_true",
                    help="(layered PSFs) add in-focus diffraction with the simulator's default optics")
+    p.add_argument("--coc_energy", type=float, default=0.0,
+                   help="energy-conserving defocus in [0, 1] for training (and --psf gaussian simulation); "
+                        "0 = original DOF-GS; > 0 adds _ec<value>")
     p.add_argument("--noise_scaling", choices=["read", "shot"], default="shot",
                    help="noise growth for exposure e < 1: read -> s / e, shot -> s / sqrt(e)")
     p.add_argument("--equal_total_exposure", action="store_true",
@@ -184,6 +200,8 @@ def parse_args():
         p.error("--noise_std must be >= 0")
     if a.disk_copies is not None and a.disk_copies < 1:
         p.error("--disk_copies must be >= 1")
+    if not 0.0 <= a.coc_energy <= 1.0:
+        p.error("--coc_energy must be in [0, 1]")
     if a.densify_grad_threshold is not None and a.densify_grad_threshold <= 0:
         p.error("--densify_grad_threshold must be > 0")
     if a.equal_total_exposure and a.slit_exposure is not None:
@@ -272,6 +290,11 @@ def build_variant_config(base_cfg_path, a, images_per_pose, is_slit, dir_loss=No
         # ground-truth optics of the simulated dataset (slit and disk alike)
         conf.optics_from_sim_gt = a.optics
         parts.append(f"opt{a.optics}")
+    # energy-conserving defocus (slit and disk alike); explicit in the config so that
+    # a run does not depend on the value written by the simulator
+    conf.coc_energy = float(a.coc_energy)
+    if a.coc_energy > 0:
+        parts.append(f"ec{a.coc_energy:g}")
     if is_slit:
         # explicit statistic in the config, so the run does not depend on the code default
         # (a disk has a single group: unchanged either way)
@@ -344,6 +367,13 @@ def main():
     # PSF model: same scene-name suffix as tools/simulate_slit_dataset.py (psf_suffix)
     ptag = PSF_SUFFIX[a.psf] + ("_diff" if a.diffraction else "")
     psf_args = ["--psf", a.psf] + (["--diffraction"] if a.diffraction else [])
+    # energy-conserving Gaussian-PSF captures get their own scene names (as in the simulator)
+    ptag += f"_ec{a.coc_energy:g}" if (a.psf == "gaussian" and a.coc_energy > 0) else ""
+    psf_args += ["--coc_energy", repr(a.coc_energy)]
+    if a.coc_energy > 0:
+        print(f"Energy-conserving CoC: coc_energy = {a.coc_energy:g} for training"
+              + (" and for the simulated captures" if a.psf == "gaussian" else
+                 f" (the {a.psf} captures are physical convolutions and are not changed)"))
     # focus of the simulated captures (same scene-name suffix as tools/simulate_slit_dataset.py)
     ftag = "_pf" if a.focus_mode == "per_pose" else ""
     psf_args += ["--focus_mode", a.focus_mode, "--focus_range", repr(a.focus_range[0]), repr(a.focus_range[1])]

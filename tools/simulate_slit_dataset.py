@@ -204,6 +204,11 @@ def parse_args():
     p.add_argument("--focal_mm", type=float, default=50.0, help="focal length for diffraction (mm)")
     p.add_argument("--pixel_um", type=float, default=4.0,
                    help="effective pixel pitch of the simulated images (um): sensor pitch x downsampling")
+    p.add_argument("--coc_energy", type=float, default=0.0,
+                   help="energy-conserving defocus of the rasterizer (--psf gaussian), in [0, 1]: the opacity of a "
+                        "defocused splat is multiplied by (det S0 / det(S0 + dS))^(coc_energy / 2). 0 = original "
+                        "DOF-GS (default); > 0 adds _ec<value> to the scene name and is also written to the training "
+                        "config. Layered PSFs are convolutions already and ignore it for the captures.")
     p.add_argument("--aperture_area_mm2", type=float, default=40.0,
                    help="physical aperture area (mm^2); 40 = 10 x 4 mm slit (a = 0.4) or 7.1 mm disk")
     a = p.parse_args()
@@ -223,6 +228,11 @@ def parse_args():
         p.error("--n_layers and --supersample must be >= 1")
     if not 0.0 <= a.focus_range[0] < a.focus_range[1] <= 1.0:
         p.error("--focus_range must satisfy 0 <= lo < hi <= 1")
+    if not 0.0 <= a.coc_energy <= 1.0:
+        p.error("--coc_energy must be in [0, 1]")
+    if a.coc_energy > 0 and a.psf != "gaussian":
+        print(f"[INFO] --coc_energy {a.coc_energy:g} does not change layered ({a.psf}) captures; it is only "
+              f"written to the training config.")
     return a
 
 
@@ -232,6 +242,11 @@ PSF_SUFFIX = {"gaussian": "", "box": "_box", "gaussian_layered": "_glayer"}
 def psf_suffix(psf, diffraction):
     """Scene-name suffix of a PSF model (shared with tools/run_design_sweep.py)."""
     return PSF_SUFFIX[psf] + ("_diff" if diffraction else "")
+
+
+def coc_energy_suffix(psf, coc_energy):
+    """Scene-name suffix of an energy-conserving Gaussian-PSF simulation (shared with run_design_sweep)."""
+    return f"_ec{coc_energy:g}" if (psf == "gaussian" and coc_energy > 0) else ""
 
 
 def physical_aperture(a, aperture, K_L, K_W):
@@ -389,6 +404,7 @@ def main():
     if a.focus_mode == "per_pose":
         base += "_pf"                                # per-pose focus
     base += psf_suffix(a.psf, a.diffraction)
+    base += coc_energy_suffix(a.psf, a.coc_energy)
     new_scene = a.new_scene or base
 
     # effective noise std of a capture, after the gain that restores full brightness
@@ -409,6 +425,11 @@ def main():
     test_cams = sorted(scene.getTestCameras(), key=lambda c: c.image_name)
     # PSF variance coefficient used for the simulation
     gaussians.aperture_coeff = SLIT_APERTURE_COEFF if a.aperture == "slit" else DISK_UNIFORM_COEFF
+    # energy-conserving defocus of the rasterizer (Gaussian PSF captures only)
+    gaussians.set_coc_energy(a.coc_energy if a.psf == "gaussian" else 0.0)
+    if gaussians.coc_energy > 0:
+        print(f"Energy-conserving CoC for the captures: coc_energy = {gaussians.coc_energy:g} "
+              f"(alpha threshold {gaussians.coc_alpha_min:g})")
 
     tonemap_type = getattr(dataset, "tonemap_type", "none")
     if tonemap_type == "learn":
@@ -624,6 +645,7 @@ def main():
               layer_blur_px=([min(layer_blur_px), max(layer_blur_px)] if layer_blur_px else None),
               diffraction=dict(enabled=bool(a.diffraction), **(phys or {})),
               aperture_coeff=gaussians.aperture_coeff,
+              coc_energy=(a.coc_energy if a.psf == "gaussian" else 0.0),
               aperture_area_K2=(K_L * K_W if a.aperture == "slit" else math.pi * K_L ** 2 / 4),
               aperture_area_px2_at_max_defocus=((K_L * K_W if a.aperture == "slit" else math.pi * K_L ** 2 / 4)
                                                 * d_max ** 2),
@@ -659,6 +681,8 @@ def main():
         for k in [k for k in new_conf.keys() if str(k).startswith("slit_")]:
             new_conf.pop(k)
     new_conf.slit_group_by_pose = bool(a.group_by_pose)
+    # train with the same defocus rendering as the (Gaussian-PSF) simulation
+    new_conf.coc_energy = float(a.coc_energy)
     # one focus distance per focus group (per pose) or for all images, one aperture scale
     new_conf.share_F = "group" if a.focus_mode == "per_pose" else "global"
     new_conf.share_K = "global"

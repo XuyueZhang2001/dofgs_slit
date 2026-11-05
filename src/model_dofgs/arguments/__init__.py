@@ -91,6 +91,14 @@ class ModelParams(ParamGroup):
         #   'init'  : ground-truth values as initialisation, still learned
         #   'fixed' : ground-truth values, frozen (theta offset fixed at 0)
         self.optics_from_sim_gt = 'none'
+        # Energy-conserving defocus in the rasterizer (slit and disk alike): the opacity
+        # of a defocused splat is multiplied by (det(Sigma0) / det(Sigma0 + dSigma))^(coc_energy/2).
+        #   0   : original DOF-GS (peak opacity kept; default)
+        #   1   : integrated opacity of every splat conserved (convolution with the PSF)
+        #   (0,1): interpolation
+        self.coc_energy = 0.0
+        # Threshold of splat-pixel pairs; < 0 = automatic (1/255 for coc_energy = 0, 1e-4 otherwise).
+        self.coc_alpha_min = -1.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

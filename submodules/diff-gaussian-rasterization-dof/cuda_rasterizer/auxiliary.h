@@ -78,6 +78,37 @@ __forceinline__ __device__ SlitCoC computeSlitCoC(
 	return s;
 }
 
+// ---------------------------------------------------------------------------
+// Energy-conserving defocus (coc_energy = lambda in [0, 1]).
+//
+// Adding the defocus covariance dSigma to a splat enlarges it but keeps its
+// peak opacity, so a defocused splat carries more energy (opacity x area) than
+// the in-focus one. A convolution of the splat with the (normalised) defocus
+// PSF would lower the peak instead. The opacity is therefore multiplied by
+//     g = ( det(Sigma0) / det(Sigma0 + dSigma) )^(lambda / 2)
+// where Sigma0 is the projected 2D covariance without the Mip filter and
+// without defocus. lambda = 1 conserves the integrated opacity of every splat
+// (as Mip-Splatting does for its 2D filter); lambda = 0 is the original DOF-GS
+// (peak opacity kept); values in between interpolate. g = 1 in focus.
+// det0: det(Sigma0); detB: det(Sigma0 + dSigma). Returns g, and whether its
+// gradient is non-zero (both determinants valid and g < 1).
+// ---------------------------------------------------------------------------
+#define COC_ENERGY_DET_EPS 1e-12f
+
+__forceinline__ __device__ float cocEnergyFactor(float det0, float detB, float lambda, bool& active)
+{
+	active = false;
+	if (lambda <= 0.0f)
+		return 1.0f;
+	if (det0 <= COC_ENERGY_DET_EPS || detB <= COC_ENERGY_DET_EPS)
+		return (det0 <= COC_ENERGY_DET_EPS && detB > COC_ENERGY_DET_EPS) ? 0.0f : 1.0f;
+	const float r = det0 / detB;
+	if (r >= 1.0f)
+		return 1.0f;
+	active = true;
+	return powf(r, 0.5f * lambda);
+}
+
 // Spherical harmonics coefficients
 __device__ const float SH_C0 = 0.28209479177387814f;
 __device__ const float SH_C1 = 0.4886025119029199f;

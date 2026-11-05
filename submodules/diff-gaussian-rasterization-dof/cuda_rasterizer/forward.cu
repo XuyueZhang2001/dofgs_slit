@@ -174,6 +174,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float* Kw,
 	const float* theta,
 	const float aperture_coeff,
+	const float coc_energy,
 	const int vIdx,
 	const glm::vec3* cam_pos,
 	const int W, int H,
@@ -237,6 +238,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float lambda2_0 = mid_0 - sqrt(max(0.1f, mid_0 * mid_0 - det_0));
 	float my_radius_0 = ceil(3.f * sqrt(max(lambda1_0, lambda2_0)));
 
+	// det(Sigma0): projected covariance without the Mip filter and without
+	// defocus, the reference of the energy-conserving CoC (cocEnergyFactor).
+	const float det_sigma0 = (cov.x - kernel_size) * (cov.z - kernel_size) - cov.y * cov.y;
+
 	// Add the (possibly anisotropic) defocus covariance of the slit aperture.
 	// K is the long-axis aperture scale, Kw the short-axis scale and theta the
 	// slit orientation in image space. With K == Kw this is the original
@@ -255,6 +260,13 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float o_coef = sqrt(det_0_pri / (det_1_pri+1e-6) + 1e-6);
 	if (det_0_pri <= 1e-6 || det_1_pri <= 1e-6){
 		o_coef = 0.0f;
+	}
+	// Energy-conserving CoC: lower the opacity of a defocused splat by
+	// (det(Sigma0) / det(Sigma0 + dSigma))^(coc_energy / 2); 1 for coc_energy = 0.
+	if (coc_energy > 0.0f)
+	{
+		bool energy_active;
+		o_coef *= cocEnergyFactor(det_sigma0, det_0_pri, coc_energy, energy_active);
 	}
 
 	// Invert covariance (EWA algorithm)
@@ -320,7 +332,8 @@ renderCUDA(
 	float* __restrict__ out_color,
 	float* __restrict__ out_depth,
 	float* __restrict__ out_xy,
-	float* __restrict__ coc_alpha)
+	float* __restrict__ coc_alpha,
+	const float alpha_min)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -402,7 +415,9 @@ renderCUDA(
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f)
+			// alpha_min: 1/255 in the original 3DGS; lower for the
+			// energy-conserving CoC, whose defocused splats are faint.
+			if (alpha < alpha_min)
 				continue;
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
@@ -462,7 +477,8 @@ void FORWARD::render(
 	float* out_color,
 	float* out_depth,
 	float* out_xy,
-	float* coc_alpha)
+	float* coc_alpha,
+	const float alpha_min)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -480,7 +496,8 @@ void FORWARD::render(
 		out_color,
 		out_depth,
 		out_xy,
-		coc_alpha);
+		coc_alpha,
+		alpha_min);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
@@ -500,6 +517,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float* Kw,
 	const float* theta,
 	const float aperture_coeff,
+	const float coc_energy,
 	const int vIdx,
 	const glm::vec3* cam_pos,
 	const int W, int H,
@@ -531,7 +549,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		colors_precomp,
 		viewmatrix, 
 		projmatrix,
-		F, K, Kw, theta, aperture_coeff, vIdx,
+		F, K, Kw, theta, aperture_coeff, coc_energy, vIdx,
 		cam_pos,
 		W, H,
 		tan_fovx, tan_fovy,

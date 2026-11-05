@@ -44,7 +44,8 @@ namespace BACKWARD
 		float3* dL_dmean3D,
 		float4* dL_dconic2D,
 		float* dL_dopacity,
-		float* dL_dcolors);
+		float* dL_dcolors,
+		const float alpha_min);
 
 	void preprocess(
 		int P, int D, int M,
@@ -63,6 +64,7 @@ namespace BACKWARD
 		const float* Kw,
 		const float* theta,
 		const float aperture_coeff,
+		const float coc_energy,
 		const float coc2z_coeff,
 		const int vIdx,
 		const float focal_x, float focal_y,

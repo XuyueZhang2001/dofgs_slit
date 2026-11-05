@@ -219,6 +219,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* Kw,
 	const float* theta,
 	const float aperture_coeff,
+	const float coc_energy,
+	const float alpha_min,
 	const int vIdx,
 	const float* cam_pos,
 	const float tan_fovx, float tan_fovy,
@@ -271,7 +273,7 @@ int CudaRasterizer::Rasterizer::forward(
 		cov3D_precomp,
 		colors_precomp,
 		viewmatrix, projmatrix,
-		F, K, Kw, theta, aperture_coeff, vIdx,
+		F, K, Kw, theta, aperture_coeff, coc_energy, vIdx,
 		(glm::vec3*)cam_pos,
 		width, height,
 		focal_x, focal_y,
@@ -356,7 +358,8 @@ int CudaRasterizer::Rasterizer::forward(
 		out_color,
 		out_depth,
 		out_xy,
-		coc_alpha), debug)
+		coc_alpha,
+		alpha_min), debug)
 
 	return num_rendered;
 }
@@ -381,6 +384,8 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* Kw,
 	const float* theta,
 	const float aperture_coeff,
+	const float coc_energy,
+	const float alpha_min,
 	const float coc2z_coeff,
 	const int vIdx,
 	const float* campos,
@@ -454,7 +459,8 @@ void CudaRasterizer::Rasterizer::backward(
 		(float3*)dL_dmean3D,
 		(float4*)dL_dconic,
 		dL_dopacity,
-		dL_dcolor), debug)
+		dL_dcolor,
+		alpha_min), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
@@ -471,7 +477,7 @@ void CudaRasterizer::Rasterizer::backward(
 		cov3D_ptr,
 		viewmatrix,
 		projmatrix,
-		F, K, Kw, theta, aperture_coeff, coc2z_coeff, vIdx,
+		F, K, Kw, theta, aperture_coeff, coc_energy, coc2z_coeff, vIdx,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
 		kernel_size,

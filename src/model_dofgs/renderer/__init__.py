@@ -63,7 +63,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
         vIdx = select_view,
         coc2z_coeff = 0.0,
         debug=pipe.debug,
-        aperture_coeff = pc.aperture_coeff
+        aperture_coeff = pc.aperture_coeff,
+        # energy-conserving defocus (GaussianModel.set_coc_energy); 0 / 1/255 = original
+        coc_energy = float(getattr(pc, 'coc_energy', 0.0)),
+        alpha_min = float(getattr(pc, 'coc_alpha_min', 1.0 / 255.0)),
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)

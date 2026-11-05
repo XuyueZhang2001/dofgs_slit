@@ -38,6 +38,7 @@ namespace FORWARD
 		const float* Kw,
 		const float* theta,
 		const float aperture_coeff,
+		const float coc_energy,
 		const int vIdx,
 		const glm::vec3* cam_pos,
 		const int W, int H,
@@ -74,7 +75,8 @@ namespace FORWARD
 		float* out_color,
 		float* out_depth,
 		float* out_xy,
-		float* coc_alpha);
+		float* coc_alpha,
+		const float alpha_min);
 }
 
 

@@ -185,6 +185,11 @@ def training(GaussianModel, dataset, opt, pipe, testing_iterations, saving_itera
     gaussians.setup_defocus_params(len(viewpoint_stack), scene.cameras_translate,
                                     dataset.source_path, mask_act='sigmoid', COC_MAX=dataset.coc_max,
                                     slit_cfg=slit_cfg, optics=optics, share_cfg=share_cfg)
+    # Energy-conserving defocus (ModelParams coc_energy; 0 = original DOF-GS)
+    gaussians.set_coc_energy(getattr(dataset, 'coc_energy', 0.0), getattr(dataset, 'coc_alpha_min', -1.0))
+    if gaussians.coc_energy > 0:
+        print(f'Energy-conserving CoC: coc_energy = {gaussians.coc_energy:g}, '
+              f'alpha threshold {gaussians.coc_alpha_min:g}')
     if optics_mode == 'fixed':
         # F, K, width ratio and theta offset receive no gradients; the optimizer skips them
         gaussians.freeze_defocus_params()
