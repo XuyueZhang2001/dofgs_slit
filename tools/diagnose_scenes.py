@@ -29,6 +29,10 @@ Output: printed and saved as <out>/diagnose.md (+ diagnose.csv).
 Usage (from the repository root):
     python tools/diagnose_scenes.py
     python tools/diagnose_scenes.py --scenes real_sausage real_cake real_cisco --blur_thresh 4
+    python tools/diagnose_scenes.py --psf gaussian_layered --orig_folder none
+    python tools/diagnose_scenes.py --coc_energy 0          # earlier runs (original CoC)
+Default dataset suffix and model folders as in tools/summarize_scenes.py
+(--coc_energy, default 1, and --psf); --orig_folder none skips the original slit model.
 """
 import argparse
 import csv
@@ -43,6 +47,8 @@ from PIL import Image
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(REPO_ROOT)
+sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+from summarize_scenes import PSF_TAG, default_names  # noqa: E402
 
 NEW, ORIG, DISK = "slit (densmax+L_dir)", "slit (orig)", "disk"
 REAL_SCENES = ["real_cake", "real_caps", "real_cisco", "real_coral", "real_cupcake",
@@ -53,17 +59,28 @@ def parse_args():
     p = argparse.ArgumentParser(description="Per-scene diagnosis of the slit vs disk gain")
     p.add_argument("--scenes", nargs="+", default=REAL_SCENES)
     p.add_argument("--design", default="n4_a0.40")
-    p.add_argument("--suffix", default="_pf", help="dataset suffix (_pf = per-pose focus, '' = global focus)")
+    p.add_argument("--coc_energy", type=float, default=1.0,
+                   help="energy-conserving CoC of the runs (default 1; sets the default names)")
+    p.add_argument("--psf", choices=sorted(PSF_TAG), default="gaussian")
+    p.add_argument("--suffix", default=None,
+                   help="dataset suffix (default: _pf + PSF tag [+ _ec<coc_energy> for gaussian]; '' = global focus)")
     p.add_argument("--data_root", default="./data/slit_sim")
     p.add_argument("--root", default="./output/model_dofgs")
-    p.add_argument("--new_folder", default="slit_sim_dir0.005_densmax")
-    p.add_argument("--orig_folder", default="slit_sim")
-    p.add_argument("--disk_folder", default="slit_sim")
+    p.add_argument("--new_folder", default=None)
+    p.add_argument("--orig_folder", default=None, help="original slit model; 'none' skips it")
+    p.add_argument("--disk_folder", default=None)
     p.add_argument("--blur_thresh", type=float, default=4.0,
                    help="disk blur diameter (px) above which a pixel counts as strongly blurred")
     p.add_argument("--max_poses", type=int, default=0, help="use at most this many training poses (0 = all)")
     p.add_argument("--out", default="./output/scene_summary")
-    return p.parse_args()
+    a = p.parse_args()
+    d = default_names(a.coc_energy, a.psf)
+    for k in ("suffix", "new_folder", "orig_folder", "disk_folder"):
+        if getattr(a, k) is None:
+            setattr(a, k, d[k])
+    if str(a.orig_folder).lower() == "none" or a.orig_folder == a.new_folder:
+        a.orig_folder = None
+    return a
 
 
 # ---------------------------------------------------------------- helpers
@@ -210,7 +227,8 @@ def main():
             continue
         sst = dataset_stats(slit_ds, a.blur_thresh, a.max_poses)   # only its long-axis blur is reported
         ev = {NEW: load_eval(os.path.join(a.root, a.new_folder, f"slitsim_{s}_{a.design}{a.suffix}")),
-              ORIG: load_eval(os.path.join(a.root, a.orig_folder, f"slitsim_{s}_{a.design}{a.suffix}")),
+              ORIG: (load_eval(os.path.join(a.root, a.orig_folder, f"slitsim_{s}_{a.design}{a.suffix}"))
+                     if a.orig_folder else None),
               DISK: load_eval(os.path.join(a.root, a.disk_folder, f"disksim_{s}{a.suffix}"))}
 
         def d(key, x, y=DISK):
@@ -226,7 +244,7 @@ def main():
                    test_disk=(ev[DISK] or {}).get("test_psnr"),
                    test_d_orig=d("test_psnr", ORIG), test_d_new=d("test_psnr", NEW),
                    train_d_orig=d("train_rec", ORIG), train_d_new=d("train_rec", NEW),
-                   in_disk=(ev[DISK] or {}).get("train_in"), in_slit=(ev[ORIG] or {}).get("train_in"),
+                   in_disk=(ev[DISK] or {}).get("train_in"), in_slit=(ev[ORIG] or ev[NEW] or {}).get("train_in"),
                    gap_disk=((ev[DISK]["train_rec"] - ev[DISK]["test_psnr"])
                              if ev[DISK] and ev[DISK]["train_rec"] is not None and ev[DISK]["test_psnr"] is not None
                              else None))
@@ -260,7 +278,7 @@ def main():
     t = a.blur_thresh
     L = [f"# Per-scene diagnosis of the slit vs disk gain ({len(rows)} scenes)", "",
          f"Datasets `slitsim_<scene>_{a.design}{a.suffix}` / `disksim_<scene>{a.suffix}`; models "
-         f"`{a.new_folder}` (densmax+L_dir), `{a.orig_folder}` (orig slit), `{a.disk_folder}` (disk).", "",
+         f"`{a.new_folder}` (densmax+L_dir), `{a.orig_folder or 'none'}` (orig slit), `{a.disk_folder}` (disk).", "",
          "## 1. Scene statistics (training poses) and the gain", "",
          "rel. depth = d_max·F (max |F/z − 1| at the reference focus); disk blur = blur-disk diameter (px) "
          f"over pixels with geometry; >{t:g}px = share of those pixels; bg = pixels without geometry; "

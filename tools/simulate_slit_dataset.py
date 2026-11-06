@@ -204,11 +204,12 @@ def parse_args():
     p.add_argument("--focal_mm", type=float, default=50.0, help="focal length for diffraction (mm)")
     p.add_argument("--pixel_um", type=float, default=4.0,
                    help="effective pixel pitch of the simulated images (um): sensor pitch x downsampling")
-    p.add_argument("--coc_energy", type=float, default=0.0,
+    p.add_argument("--coc_energy", type=float, default=1.0,
                    help="energy-conserving defocus of the rasterizer (--psf gaussian), in [0, 1]: the opacity of a "
-                        "defocused splat is multiplied by (det S0 / det(S0 + dS))^(coc_energy / 2). 0 = original "
-                        "DOF-GS (default); > 0 adds _ec<value> to the scene name and is also written to the training "
-                        "config. Layered PSFs are convolutions already and ignore it for the captures.")
+                        "defocused splat is multiplied by (det S0 / det(S0 + dS))^(coc_energy / 2). 1 (default) = "
+                        "energy-conserving, 0 = original DOF-GS (the earlier datasets); > 0 adds _ec<value> to the "
+                        "scene name. Also written to the training config. Layered PSFs are convolutions already and "
+                        "ignore it for the captures.
     p.add_argument("--aperture_area_mm2", type=float, default=40.0,
                    help="physical aperture area (mm^2); 40 = 10 x 4 mm slit (a = 0.4) or 7.1 mm disk")
     a = p.parse_args()

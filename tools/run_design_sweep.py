@@ -86,9 +86,10 @@ PSF model (see tools/simulate_slit_dataset.py and tools/psf_render.py)
 Energy-conserving defocus (rasterizer)
   --coc_energy lambda
                       in [0, 1]; the opacity of a defocused splat is multiplied by
-                      (det S0 / det(S0 + dS_CoC))^(lambda / 2). 0 (default) is the
-                      original DOF-GS (peak opacity kept), 1 conserves the integrated
-                      opacity of every splat (a convolution with the PSF). Used for
+                      (det S0 / det(S0 + dS_CoC))^(lambda / 2). 1 (default) conserves
+                      the integrated opacity of every splat (a convolution with the PSF),
+                      0 is the original DOF-GS (peak opacity kept; the earlier runs,
+                      whose names have no _ec suffix). Used for
                       training (slit and disk, model_folder suffix _ec<lambda>) and,
                       with --psf gaussian, for the simulated captures as well (scene
                       suffix _ec<lambda>). Layered datasets (--psf gaussian_layered /
@@ -175,9 +176,9 @@ def parse_args():
                         "slit and disk always use the same model")
     p.add_argument("--diffraction", action="store_true",
                    help="(layered PSFs) add in-focus diffraction with the simulator's default optics")
-    p.add_argument("--coc_energy", type=float, default=0.0,
+    p.add_argument("--coc_energy", type=float, default=1.0,
                    help="energy-conserving defocus in [0, 1] for training (and --psf gaussian simulation); "
-                        "0 = original DOF-GS; > 0 adds _ec<value>")
+                        "default 1; 0 = original DOF-GS (the earlier runs); > 0 adds _ec<value>")
     p.add_argument("--noise_scaling", choices=["read", "shot"], default="shot",
                    help="noise growth for exposure e < 1: read -> s / e, shot -> s / sqrt(e)")
     p.add_argument("--equal_total_exposure", action="store_true",

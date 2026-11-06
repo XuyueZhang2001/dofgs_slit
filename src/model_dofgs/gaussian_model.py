@@ -91,6 +91,8 @@ class GaussianModel:
         self.aperture_coeff = DISK_APERTURE_COEFF
         # Energy-conserving defocus: 0 = original DOF-GS (peak opacity kept),
         # 1 = integrated opacity of every splat conserved (see set_coc_energy).
+        # Training sets it from ModelParams.coc_energy (default 1); 0 here is the
+        # value of models loaded without it (saved before the option existed).
         self.coc_energy = 0.0
         self.coc_alpha_min = ALPHA_MIN_DEFAULT
         self.n_view = 1

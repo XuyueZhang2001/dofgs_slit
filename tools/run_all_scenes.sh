@@ -7,13 +7,15 @@
 #               defocus for the reference focus at the median inverse depth); it only
 #               provides the aperture area and the reference focus and is not trained
 #   slit (densmax+L_dir) n = 4, a = 0.4, max_angle densification + directional AiF loss 0.005
-#               (code defaults)   -> slit_sim_dir0.005_densmax/slitsim_<scene>_n4_a0.40<sfx>
+#               (code defaults)   -> slit_sim_dir0.005<ec>_densmax/slitsim_<scene>_n4_a0.40<sfx>
 #   slit (orig) same data, no directional loss, mean densification
-#                                 -> slit_sim/slitsim_<scene>_n4_a0.40<sfx>
-#   disk        equal-area disk, one capture per pose -> slit_sim/disksim_<scene><sfx>
-# Focus (--focus_mode): per_pose (default, <sfx> = _pf): every pose focuses at its own
+#                                 -> slit_sim<ec>/slitsim_<scene>_n4_a0.40<sfx>
+#   disk        equal-area disk, one capture per pose -> slit_sim<ec>/disksim_<scene><sfx>
+# Energy-conserving CoC (--coc_energy, default 1): <ec> = _ec1 in the model folders and
+# in <sfx>; --coc_energy 0 is the original CoC of the earlier runs (<ec> empty).
+# Focus (--focus_mode): per_pose (default, <sfx> = _pf<ec>): every pose focuses at its own
 # random depth (shared by its slit angles); training shares one F per pose and one K.
-# global: one focus for all poses (the earlier datasets, <sfx> empty).
+# global: one focus for all poses (the earlier datasets, <sfx> = <ec>).
 # Noise-free, Gaussian PSF (--psf gaussian). Finished steps are skipped, so the
 # script can be restarted. The source model iteration is the latest one found in
 # output/<model_version>/<model_folder>/<scene>/point_cloud (or --iteration).
@@ -23,6 +25,7 @@
 #   bash tools/run_all_scenes.sh --gpu 1 --stage train             # then train + evaluate
 #   bash tools/run_all_scenes.sh --gpu 0 --stage all real_caps real_cisco   # a subset on another GPU
 #   bash tools/run_all_scenes.sh --gpu 1 --focus_mode global        # the earlier global-focus setting
+#   bash tools/run_all_scenes.sh --gpu 1 --coc_energy 0            # the original CoC (earlier runs)
 # Stages: simulate (datasets + K check), train (train + evaluate, needs the datasets),
 #         all (both). Scenes whose simulation warns that K cannot be represented
 #         (K < 101) are not trained.
@@ -34,6 +37,7 @@ GPU=0
 STAGE=all
 ITER=""
 FOCUS=per_pose
+EC=1
 SCENES=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -41,13 +45,17 @@ while [ $# -gt 0 ]; do
         --stage) STAGE="$2"; shift 2 ;;
         --iteration) ITER="$2"; shift 2 ;;
         --focus_mode) FOCUS="$2"; shift 2 ;;
+        --coc_energy) EC="$2"; shift 2 ;;
         -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) SCENES+=("$1"); shift ;;
     esac
 done
 case "$STAGE" in simulate|train|all) ;; *) echo "--stage must be simulate, train or all"; exit 1 ;; esac
 case "$FOCUS" in per_pose) SFX=_pf ;; global) SFX="" ;; *) echo "--focus_mode must be per_pose or global"; exit 1 ;; esac
-echo "focus mode: $FOCUS (dataset suffix '${SFX}')"
+# energy-conserving CoC: dataset (Gaussian PSF) and model-folder tag, as in run_design_sweep.py
+ECTAG=$(python -c "v = float('$EC'); print(f'_ec{v:g}' if v > 0 else '')") || exit 1
+SFX="${SFX}${ECTAG}"
+echo "focus mode: $FOCUS, coc_energy: $EC (dataset suffix '${SFX}')"
 if [ ${#SCENES[@]} -eq 0 ]; then
     SCENES=(real_cake real_caps real_cisco real_coral real_cupcake real_cups real_daisy real_sausage real_seal real_tools)
 fi
@@ -99,7 +107,7 @@ for s in "${SCENES[@]}"; do
             echo "[skip] reference dataset slitsim_${s} exists"
         fi
         python tools/run_design_sweep.py --config "$cfg" --scene "$s" --iteration "$it" --gpu "$GPU" \
-            --focus_mode "$FOCUS" --steps simulate || { FAILED+=("$s (simulate)"); continue; }
+            --focus_mode "$FOCUS" --coc_energy "$EC" --steps simulate || { FAILED+=("$s (simulate)"); continue; }
     fi
 
     if has_k_warning "$s"; then
@@ -114,10 +122,10 @@ for s in "${SCENES[@]}"; do
     fi
     # slit (densmax+L_dir: code defaults) + disk
     python tools/run_design_sweep.py --config "$cfg" --scene "$s" --iteration "$it" --gpu "$GPU" \
-        --focus_mode "$FOCUS" || FAILED+=("$s (slit densmax+L_dir / disk)")
+        --focus_mode "$FOCUS" --coc_energy "$EC" || FAILED+=("$s (slit densmax+L_dir / disk)")
     # slit (original model)
     python tools/run_design_sweep.py --config "$cfg" --scene "$s" --iteration "$it" --gpu "$GPU" \
-        --focus_mode "$FOCUS" --no_disk --dir_loss 0 --densify_stat mean \
+        --focus_mode "$FOCUS" --coc_energy "$EC" --no_disk --dir_loss 0 --densify_stat mean \
         || FAILED+=("$s (slit original)")
 done
 
@@ -127,5 +135,5 @@ echo "================================ done ================================"
 [ ${#K_WARN[@]} -gt 0 ] && printf 'K below the representable range (not trained): %s\n' "${K_WARN[@]}"
 [ ${#FAILED[@]} -gt 0 ] && printf 'failed: %s\n' "${FAILED[@]}"
 if [ "$STAGE" != "simulate" ]; then
-    python tools/summarize_scenes.py --suffix "$SFX" --scenes "${SCENES[@]}"
+    python tools/summarize_scenes.py --coc_energy "$EC" --suffix "$SFX" --scenes "${SCENES[@]}"
 fi
